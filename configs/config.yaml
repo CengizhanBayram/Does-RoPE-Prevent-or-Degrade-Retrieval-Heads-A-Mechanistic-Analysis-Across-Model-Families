@@ -1,0 +1,53 @@
+models:
+  llama3:
+    hf_id: "meta-llama/Meta-Llama-3.1-8B"
+    theta: 500000
+    n_layers: 32
+    n_heads: 32
+    head_dim: 128
+    load_in_8bit: true
+  llama2:
+    hf_id: "meta-llama/Llama-2-7b-hf"
+    theta: 10000
+    n_layers: 32
+    n_heads: 32
+    head_dim: 128
+    load_in_8bit: true
+  qwen:
+    hf_id: "Qwen/Qwen2.5-7B"
+    theta: 1000000
+    n_layers: 28
+    n_heads: 28
+    head_dim: 128
+    load_in_8bit: true
+  olmo:
+    hf_id: "allenai/OLMo-2-1124-7B"
+    theta: 500000
+    n_layers: 32
+    n_heads: 32
+    head_dim: 128
+    load_in_8bit: true
+
+niah:
+  context_lengths: [1024, 2048, 4096, 8192]
+  needle_positions: [0.1, 0.25, 0.5, 0.75, 0.9]
+  n_samples: 100
+  score_threshold: 0.1
+
+dimension_utility:
+  n_rope_freq_bins: 8
+  distance_bins: [[0, 512], [512, 2048], [2048, 8192]]
+
+activation_patching:
+  k_dims: 16
+  n_samples: 50
+
+olmo_checkpoints:
+  step_stride: 10000
+  resume: true
+  cache_dir: "./cache/olmo_checkpoints"
+
+output:
+  results_dir: "./results"
+  figures_dpi: 300
+  figure_format: "pdf"

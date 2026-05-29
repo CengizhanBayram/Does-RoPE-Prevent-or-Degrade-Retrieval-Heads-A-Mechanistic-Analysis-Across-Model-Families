@@ -1,0 +1,14 @@
+transformers==4.47.0
+bitsandbytes==0.45.0
+accelerate==1.2.1
+datasets==3.2.0
+scipy==1.14.1
+scikit-learn==1.6.0
+matplotlib==3.9.4
+seaborn==0.13.2
+pandas==2.2.3
+huggingface_hub==0.27.0
+tqdm==4.67.1
+pyyaml==6.0.2
+torch>=2.1.0
+numpy>=1.26.0
