@@ -157,6 +157,8 @@ def process_checkpoint(
         return None
     finally:
         loader.clear_checkpoint(model)
+        # Free this checkpoint's ~28 GB of shards before the next one downloads.
+        loader.purge_checkpoint_files()
 
 
 def load_all_checkpoint_results(results_dir: Path) -> list[dict]:

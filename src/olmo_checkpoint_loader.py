@@ -152,6 +152,16 @@ class OLMoCheckpointLoader:
             (model, tokenizer) tuple.
         """
         import torch
+
+        # Reclaim VRAM from any previously-loaded checkpoint BEFORE loading the
+        # next one. Otherwise device_map="auto" sees the GPU as full and offloads
+        # layers to CPU/disk, which 8-bit (bitsandbytes) cannot do → it raises
+        # "Some modules are dispatched on the CPU or the disk". The caller must
+        # also drop its own references (model, detector, analyzer) first.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
         use_8bit = load_in_8bit and _has_bitsandbytes()
@@ -202,10 +212,13 @@ class OLMoCheckpointLoader:
 
     def clear_checkpoint(self, model: Any) -> None:
         """
-        Delete a model from memory and release CUDA cache.
+        Release CUDA cache after a checkpoint is done with.
 
-        Args:
-            model: The model to delete.
+        NOTE: ``del model`` here only drops THIS function's reference. The caller
+        must also drop its own references (the model variable, plus any
+        RetrievalHeadDetector / DimensionUtilityAnalyzer holding ``self.model``)
+        for the GPU memory to actually free — otherwise the next 8-bit load
+        offloads to CPU and fails.
         """
         import torch
 
@@ -214,6 +227,31 @@ class OLMoCheckpointLoader:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         logger.info("Checkpoint cleared from memory.")
+
+    def purge_checkpoint_files(self) -> float:
+        """
+        Delete the downloaded checkpoint weights from disk to free space.
+
+        Each OLMo-2 checkpoint is ~28 GB of shards; across a 45-checkpoint sweep
+        this fills the disk ("No space left on device"). Call after every
+        checkpoint (success OR failure — failed loads still leave downloaded
+        shards). The next revision re-downloads.
+
+        Returns:
+            Approximate GB freed.
+        """
+        import shutil
+
+        if not self.cache_dir or not os.path.isdir(self.cache_dir):
+            return 0.0
+        freed = sum(
+            f.stat().st_size for f in Path(self.cache_dir).rglob("*") if f.is_file()
+        )
+        shutil.rmtree(self.cache_dir, ignore_errors=True)
+        os.makedirs(self.cache_dir, exist_ok=True)
+        gb = freed / 1e9
+        logger.info("Purged checkpoint cache (~%.1f GB freed).", gb)
+        return gb
 
     # ------------------------------------------------------------------
     # Metadata
