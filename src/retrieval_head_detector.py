@@ -6,7 +6,6 @@ Implements Wu et al. (ICLR 2025) methodology.
 from __future__ import annotations
 
 import gc
-import json
 import logging
 import random
 import string
@@ -19,7 +18,6 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-# Fallback haystack sentences when PG-19 / Wikipedia is unavailable
 _FALLBACK_SENTENCES: list[str] = [
     "The quick brown fox jumps over the lazy dog.",
     "In the beginning God created the heavens and the earth.",
@@ -30,7 +28,6 @@ _FALLBACK_SENTENCES: list[str] = [
     "The sky above the port was the color of television, tuned to a dead channel.",
     "It was a bright cold day in April, and the clocks were striking thirteen.",
     "Lolita, light of my life, fire of my loins.",
-    "Happy families are all alike; every unhappy family is unhappy in its own way.",
     "It was the epoch of belief, it was the epoch of incredulity.",
     "We were somewhere around Barstow on the edge of the desert when the drugs began to take hold.",
     "Many years later, as he faced the firing squad, Colonel Aureliano Buendía was to remember that distant afternoon.",
@@ -51,9 +48,7 @@ _FALLBACK_SENTENCES: list[str] = [
     "If you really want to hear about it, the first thing you'll probably want to know is where I was born.",
     "There was a boy called Eustace Clarence Scrubb, and he almost deserved it.",
     "The drought had lasted now for ten million years, and the reign of the terrible lizards had long since ended.",
-    "It was the afternoon of my eighty-first birthday, and I was in bed with my catamite when Ali announced that the archbishop had come to see me.",
     "All children, except one, grow up.",
-    "Science has now proven that raindrops keep falling on my head.",
     "One morning, when Gregor Samsa woke from troubled dreams, he found himself transformed in his bed into a horrible vermin.",
     "In the late summer of that year we lived in a house in a village that looked across the river and the plain to the mountains.",
     "Robert Cohn was once middleweight boxing champion of Princeton.",
@@ -64,13 +59,16 @@ _FALLBACK_SENTENCES: list[str] = [
     "The most merciful thing in the world, I think, is the inability of the human mind to correlate all its contents.",
     "Somewhere in la Mancha, in a place whose name I do not care to remember.",
     "A screaming comes across the sky.",
-    "They told me you had been to her, and mentioned me to him: she gave me a good character, but said I could not swim.",
     "It was a wrong number that started it, the telephone ringing three times in the dead of night.",
-    "When I finally caught up with Abraham Trahearne, he was drinking beer with an alcoholic bulldog named Fireball Roberts.",
     "Of man's first disobedience, and the fruit of that forbidden tree whose mortal taste brought death into the world.",
-    "Happy families are all alike; every unhappy family is unhappy in its own way.",
     "The world is what it is; men who are nothing, who allow themselves to become nothing, have no place in it.",
     "Time is not a line but a dimension, like the dimensions of space.",
+    "Science has now proven that raindrops keep falling on my head.",
+    "The empire at its height stretched from the Atlantic coast to central Asia.",
+    "Radio telescopes detected a repeating fast-radio burst from a distant galaxy.",
+    "Quantum computers can solve certain optimization problems exponentially faster.",
+    "The human genome contains approximately three billion base pairs.",
+    "Neural networks learn by adjusting the weights of millions of parameters.",
 ]
 
 
@@ -107,6 +105,48 @@ class RetrievalHeadDetector:
 
         self.model.eval()
         self._haystack_corpus: list[str] | None = None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_device(self) -> torch.device:
+        """Return the first non-meta parameter device (safe for quantized models)."""
+        for p in self.model.parameters():
+            if p.device.type != "meta":
+                return p.device
+        # All params on meta (rare) — fall back to cuda/cpu
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _get_layers(self):
+        """Return model layer list, handling LLaMA / OLMo / Qwen variants."""
+        model_inner = getattr(self.model, "model", self.model)
+        for attr in ("layers", "transformer.blocks", "transformer.h", "decoder.layers"):
+            obj = model_inner
+            for part in attr.split("."):
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                return obj
+        raise AttributeError(
+            "Cannot locate layer list. Tried: layers, transformer.blocks, "
+            "transformer.h, decoder.layers"
+        )
+
+    def _get_n_layers_heads(self) -> tuple[int, int]:
+        """Return (n_layers, n_heads) from model config."""
+        try:
+            return (
+                self.model.config.num_hidden_layers,
+                self.model.config.num_attention_heads,
+            )
+        except AttributeError:
+            layers = self._get_layers()
+            n_layers = len(layers)
+            n_heads = getattr(layers[0].self_attn, "num_heads", None) or \
+                      getattr(layers[0].self_attn, "num_attention_heads", 32)
+            return n_layers, n_heads
 
     # ------------------------------------------------------------------
     # Haystack corpus
@@ -148,7 +188,7 @@ class RetrievalHeadDetector:
     # ------------------------------------------------------------------
 
     def _generate_code(self) -> str:
-        """Generate a random 5-digit alphanumeric passphrase code."""
+        """Generate a random 5-character alphanumeric passphrase code."""
         return "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
 
     def _build_haystack(self, context_length: int, sentences: list[str]) -> str:
@@ -158,8 +198,7 @@ class RetrievalHeadDetector:
 
         parts: list[str] = []
         total_chars = 0
-        # Rough estimate: 1 token ≈ 4 characters
-        char_budget = context_length * 4
+        char_budget = context_length * 4  # rough estimate: 1 token ≈ 4 chars
 
         for sent in rng_sentences:
             parts.append(sent)
@@ -172,17 +211,18 @@ class RetrievalHeadDetector:
         self, haystack: str, needle: str, position: float
     ) -> tuple[str, int]:
         """
-        Insert needle at the given fractional position in haystack.
+        Insert needle at the given fractional word position in haystack.
 
         Returns:
-            (full_text, char_offset_of_needle)
+            (full_text, char_offset_of_needle_start)
         """
         words = haystack.split()
         insert_idx = max(0, min(int(len(words) * position), len(words) - 1))
         words.insert(insert_idx, needle)
         full_text = " ".join(words)
-        # Find needle start char offset
-        char_offset = full_text.index(needle)
+        # Use find() + assertion to ensure we locate the correct occurrence
+        char_offset = full_text.find(needle)
+        assert char_offset >= 0, f"Needle not found after insertion: {needle[:30]}"
         return full_text, char_offset
 
     def _find_needle_token_range(
@@ -194,7 +234,7 @@ class RetrievalHeadDetector:
         Find the start/end token indices of needle_ids inside prompt_ids.
 
         Returns:
-            (start, end) exclusive, or None if not found.
+            (start, end_exclusive) or None if not found.
         """
         n, m = len(prompt_ids), len(needle_ids)
         for i in range(n - m + 1):
@@ -212,20 +252,15 @@ class RetrievalHeadDetector:
         Generate NIAH evaluation samples.
 
         Args:
-            n_samples: Total number of samples to generate.
+            n_samples: Total number of samples to generate (distributed evenly
+                over all context_length × needle_position combinations).
             context_lengths: List of context lengths in tokens.
             needle_positions: List of fractional needle positions [0, 1].
 
         Returns:
-            List of sample dicts, each containing:
-                - prompt: str
-                - prompt_ids: list[int]
-                - code: str
-                - needle_token_ids: list[int]
-                - needle_start_idx: int
-                - needle_end_idx: int
-                - context_length: int
-                - needle_position: float
+            List of sample dicts with keys: prompt, prompt_ids, code,
+            needle_token_ids, needle_start_idx, needle_end_idx,
+            context_length, needle_position.
         """
         random.seed(self.seed)
         torch.manual_seed(self.seed)
@@ -236,20 +271,29 @@ class RetrievalHeadDetector:
         skipped = 0
 
         combos = [
-            (cl, pos)
-            for cl in context_lengths
-            for pos in needle_positions
+            (cl, pos) for cl in context_lengths for pos in needle_positions
         ]
         samples_per_combo = max(1, n_samples // len(combos))
 
         for context_length, needle_position in combos:
-            for _ in range(samples_per_combo):
+            generated_this_combo = 0
+            attempts = 0
+            # Allow extra attempts to compensate for skipped samples
+            max_attempts = samples_per_combo * 3
+
+            while generated_this_combo < samples_per_combo and attempts < max_attempts:
+                attempts += 1
                 code = self._generate_code()
                 needle = f"The secret passphrase is {code}."
                 query = "What is the secret passphrase?"
 
-                haystack = self._build_haystack(context_length, sentences)
-                full_text, _ = self._insert_needle(haystack, needle, needle_position)
+                try:
+                    haystack = self._build_haystack(context_length, sentences)
+                    full_text, _ = self._insert_needle(haystack, needle, needle_position)
+                except AssertionError:
+                    skipped += 1
+                    continue
+
                 prompt = f"{full_text}\n\n{query}\n\nAnswer:"
 
                 encoding = self.tokenizer(
@@ -260,16 +304,27 @@ class RetrievalHeadDetector:
                 )
                 prompt_ids: list[int] = encoding["input_ids"][0].tolist()
 
-                needle_encoding = self.tokenizer(
-                    needle, add_special_tokens=False
-                )
-                needle_ids: list[int] = needle_encoding["input_ids"]
+                # Tokenize needle WITHOUT special tokens, then try WITH leading space
+                # to handle tokenizers that merge the first token differently
+                needle_ids: list[int] | None = None
+                for prefix in ("", " "):
+                    candidate = self.tokenizer(
+                        prefix + needle, add_special_tokens=False
+                    )["input_ids"]
+                    # Strip BOS if accidentally included
+                    bos = self.tokenizer.bos_token_id
+                    if bos is not None and candidate and candidate[0] == bos:
+                        candidate = candidate[1:]
+                    token_range = self._find_needle_token_range(prompt_ids, candidate)
+                    if token_range is not None:
+                        needle_ids = candidate
+                        break
 
-                token_range = self._find_needle_token_range(prompt_ids, needle_ids)
-                if token_range is None:
+                if needle_ids is None or token_range is None:
                     skipped += 1
                     logger.debug(
-                        "Needle not found in tokenized prompt (context_length=%d, pos=%.2f). Skipping.",
+                        "Needle not found in tokenized prompt "
+                        "(context_length=%d, pos=%.2f). Skipping.",
                         context_length,
                         needle_position,
                     )
@@ -288,14 +343,21 @@ class RetrievalHeadDetector:
                         "needle_position": needle_position,
                     }
                 )
+                generated_this_combo += 1
 
         if skipped:
-            logger.warning("%d samples skipped (needle not found in tokens).", skipped)
+            logger.warning(
+                "%d sample attempts skipped (needle not found in tokens). "
+                "Generated %d/%d requested samples.",
+                skipped,
+                len(samples),
+                n_samples,
+            )
         logger.info("Generated %d NIAH samples.", len(samples))
         return samples
 
     # ------------------------------------------------------------------
-    # Head scoring
+    # Head scoring — hook-based, layer-by-layer (O(seq_len²) peak, not O(L·seq_len²))
     # ------------------------------------------------------------------
 
     @torch.no_grad()
@@ -303,8 +365,9 @@ class RetrievalHeadDetector:
         """
         Score every attention head on NIAH hit rate.
 
-        For each sample the last token's attention distribution is inspected;
-        a head scores a hit if argmax(attention[-1, :]) lands in [needle_start, needle_end).
+        Uses forward hooks on each self_attn module so that each layer's
+        attention matrix is processed and freed before the next layer runs.
+        Peak VRAM is O(seq_len²) per layer rather than O(n_layers · seq_len²).
 
         Args:
             samples: Output of generate_niah_samples().
@@ -312,37 +375,58 @@ class RetrievalHeadDetector:
         Returns:
             np.ndarray of shape (n_layers, n_heads) with hit rates in [0, 1].
         """
-        device = next(self.model.parameters()).device
-
-        # Infer shape from config or model
-        try:
-            n_layers = self.model.config.num_hidden_layers
-            n_heads = self.model.config.num_attention_heads
-        except AttributeError:
-            n_layers = len(self.model.model.layers)
-            n_heads = self.model.model.layers[0].self_attn.num_heads
+        device = self._get_device()
+        n_layers, n_heads = self._get_n_layers_heads()
+        layers = self._get_layers()
 
         hit_counts = np.zeros((n_layers, n_heads), dtype=np.int32)
         total_counts = np.zeros((n_layers, n_heads), dtype=np.int32)
 
+        # Track whether any layer ever returned attention weights
+        attn_weights_seen: list[bool] = [False]
+
         for i, sample in enumerate(tqdm(samples, desc="Scoring retrieval heads")):
             if i % 10 == 0:
-                logger.info(
-                    "Progress: %d/%d samples processed.", i, len(samples)
-                )
+                logger.info("Progress: %d/%d samples processed.", i, len(samples))
 
-            input_ids = torch.tensor(
-                [sample["prompt_ids"]], dtype=torch.long, device=device
-            )
             needle_start = sample["needle_start_idx"]
             needle_end = sample["needle_end_idx"]
 
+            # Per-sample attention capture dict: layer_idx → (n_heads, seq_len) on CPU
+            captured: dict[int, torch.Tensor] = {}
+            hooks = []
+
+            def _make_hook(layer_idx: int):
+                def hook(module, input_, output):
+                    # self_attn returns (attn_output, attn_weights, past_kv) or just attn_output
+                    if isinstance(output, tuple) and len(output) >= 2:
+                        attn_w = output[1]
+                        if attn_w is not None:
+                            # attn_w: (batch, n_heads_attn, seq_len, seq_len)
+                            # Move to CPU immediately and keep only last-token row
+                            last_row = attn_w[0, :, -1, :].float().cpu()
+                            captured[layer_idx] = last_row
+                            attn_weights_seen[0] = True
+                            # Replace with None in the returned tuple to free GPU memory
+                            return (output[0], None) + output[2:]
+                    return output
+                return hook
+
             try:
-                outputs = self.model(
+                for layer_idx, layer in enumerate(layers):
+                    h = layer.self_attn.register_forward_hook(_make_hook(layer_idx))
+                    hooks.append(h)
+
+                input_ids = torch.tensor(
+                    [sample["prompt_ids"]], dtype=torch.long, device=device
+                )
+                # output_attentions=True asks each self_attn to return its weights
+                self.model(
                     input_ids=input_ids,
                     output_attentions=True,
                     use_cache=False,
                 )
+
             except RuntimeError as exc:
                 if "out of memory" in str(exc).lower():
                     logger.warning(
@@ -352,29 +436,44 @@ class RetrievalHeadDetector:
                     )
                     gc.collect()
                     torch.cuda.empty_cache()
-                    continue
-                raise
+                    captured.clear()
+                else:
+                    raise
+            finally:
+                for h in hooks:
+                    h.remove()
+                if "input_ids" in dir():
+                    del input_ids
 
-            # outputs.attentions: tuple of (batch, n_heads, seq_len, seq_len)
-            attentions = outputs.attentions
-            del outputs
+            # Update hit/total counts from captured attention rows
+            for layer_idx, attn_last in captured.items():
+                # attn_last: (n_heads_captured, seq_len)
+                n_heads_captured = attn_last.shape[0]
+                argmax_positions = attn_last.argmax(dim=-1).numpy()
 
-            for layer_idx, attn in enumerate(attentions):
-                # attn: (1, n_heads, seq_len, seq_len)
-                attn_last = attn[0, :, -1, :].float()  # (n_heads, seq_len)
-                argmax_positions = attn_last.argmax(dim=-1).cpu().numpy()  # (n_heads,)
+                # Handle MQA: single KV head shared across all Q heads
+                if n_heads_captured == 1 and n_heads > 1:
+                    argmax_positions = np.repeat(argmax_positions, n_heads)
+                    n_heads_captured = n_heads
 
-                for head_idx, pos in enumerate(argmax_positions):
+                for head_idx in range(min(n_heads_captured, n_heads)):
+                    pos = int(argmax_positions[head_idx])
                     total_counts[layer_idx, head_idx] += 1
-                    if needle_start <= int(pos) < needle_end:
+                    if needle_start <= pos < needle_end:
                         hit_counts[layer_idx, head_idx] += 1
 
-            del attn, attn_last, attentions, input_ids
+            captured.clear()
             if i % 10 == 9:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-        # Avoid division by zero
+        if not attn_weights_seen[0]:
+            logger.error(
+                "No attention weights were captured (output_attentions=True may not "
+                "be supported for this model / quantization config). "
+                "All scores will be 0. Try loading without 8-bit quantization."
+            )
+
         with np.errstate(invalid="ignore"):
             scores = np.where(
                 total_counts > 0,
@@ -390,9 +489,7 @@ class RetrievalHeadDetector:
         )
         return scores.astype(np.float32)
 
-    def get_retrieval_heads(
-        self, scores: np.ndarray
-    ) -> list[tuple[int, int]]:
+    def get_retrieval_heads(self, scores: np.ndarray) -> list[tuple[int, int]]:
         """
         Return (layer, head) pairs whose score exceeds the threshold.
 
@@ -404,7 +501,9 @@ class RetrievalHeadDetector:
         """
         layer_idxs, head_idxs = np.where(scores >= self.score_threshold)
         heads = sorted(zip(layer_idxs.tolist(), head_idxs.tolist()))
-        logger.info("Found %d retrieval heads (threshold=%.2f).", len(heads), self.score_threshold)
+        logger.info(
+            "Found %d retrieval heads (threshold=%.2f).", len(heads), self.score_threshold
+        )
         return heads
 
     # ------------------------------------------------------------------

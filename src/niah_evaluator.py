@@ -156,7 +156,6 @@ class NIAHEvaluator:
         Returns:
             Full prompt string ending with "Answer:".
         """
-        # Build haystack
         parts: list[str] = []
         total_chars = 0
         char_budget = context_length * 4
@@ -205,33 +204,40 @@ class NIAHEvaluator:
         np.random.seed(self.seed)
 
         sentences = self.load_haystack_corpus()
-        device = next(self.model.parameters()).device
+        device = next(
+            (p for p in self.model.parameters() if p.device.type != "meta"),
+            next(self.model.parameters()),
+        ).device
         n_combo = len(context_lengths) * len(needle_positions)
         samples_per_combo = max(1, n_samples // n_combo)
 
-        acc_matrix = np.zeros((len(context_lengths), len(needle_positions)), dtype=np.float32)
+        acc_matrix = np.zeros(
+            (len(context_lengths), len(needle_positions)), dtype=np.float32
+        )
 
         for i, ctx_len in enumerate(tqdm(context_lengths, desc="Context lengths")):
             for j, pos in enumerate(needle_positions):
                 correct = 0
+                total = 0
                 for _ in range(samples_per_combo):
                     code = self._generate_code()
                     prompt = self.build_prompt(ctx_len, pos, code, sentences)
 
-                    encoding = self.tokenizer(
-                        prompt,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=ctx_len + 64,
-                    )
-                    input_ids = encoding["input_ids"].to(device)
-
+                    input_ids = None  # initialise so finally block is safe
+                    out = None
                     try:
+                        encoding = self.tokenizer(
+                            prompt,
+                            return_tensors="pt",
+                            truncation=True,
+                            max_length=ctx_len + 64,
+                        )
+                        input_ids = encoding["input_ids"].to(device)
+
                         out = self.model.generate(
                             input_ids,
                             max_new_tokens=20,
                             do_sample=False,
-                            temperature=1.0,
                         )
                         generated_ids = out[0, input_ids.shape[1]:]
                         generated_text = self.tokenizer.decode(
@@ -239,18 +245,25 @@ class NIAHEvaluator:
                         )
                         if code in generated_text:
                             correct += 1
+                        total += 1
+
                     except RuntimeError as exc:
                         if "out of memory" in str(exc).lower():
-                            logger.warning("OOM at ctx_len=%d; skipping.", ctx_len)
+                            logger.warning("OOM at ctx_len=%d; skipping sample.", ctx_len)
                             gc.collect()
                             torch.cuda.empty_cache()
                         else:
                             raise
                     finally:
-                        del input_ids
+                        # FIX #17: Guard del so NameError cannot occur if
+                        # the assignment above raised before completing.
+                        if input_ids is not None:
+                            del input_ids
+                        if out is not None:
+                            del out
                         torch.cuda.empty_cache()
 
-                acc_matrix[i, j] = correct / samples_per_combo
+                acc_matrix[i, j] = correct / total if total > 0 else 0.0
 
         return acc_matrix
 
@@ -265,8 +278,8 @@ class NIAHEvaluator:
         """
         Evaluate NIAH accuracy with specified attention heads masked.
 
-        Masking is implemented by zeroing the attention output for each
-        listed (layer, head) pair via forward hooks.
+        Masking zeroes each listed head's output contribution just before
+        the o_proj linear layer (i.e. the concatenated head outputs).
 
         Args:
             heads_to_mask: List of (layer_idx, head_idx) tuples.
@@ -277,24 +290,32 @@ class NIAHEvaluator:
         Returns:
             np.ndarray of shape (len(context_lengths), len(needle_positions)).
         """
+        head_dim = self._get_head_dim()
         hooks = []
-        head_dim = self.model.config.hidden_size // self.model.config.num_attention_heads
 
-        def _make_output_zero_hook(h_idx: int):
-            def hook(module, input_, output):
-                out = output[0] if isinstance(output, tuple) else output
+        # FIX #4: Use register_forward_pre_hook (signature: module, input_tuple)
+        # to zero the concatenated head outputs BEFORE o_proj processes them.
+        # The previous code used register_forward_pre_hook but with a 3-arg
+        # signature (module, input, output) which is wrong — pre_hooks only
+        # receive (module, input).
+        def _make_pre_hook(h_idx: int):
+            def hook(module, input_: tuple):
+                if not input_:
+                    return input_
+                inp = input_[0]  # (batch, seq_len, n_heads * head_dim)
+                inp = inp.clone()
                 start = h_idx * head_dim
                 end = start + head_dim
-                out = out.clone()
-                out[:, :, start:end] = 0.0
-                return (out,) + output[1:] if isinstance(output, tuple) else out
+                inp[:, :, start:end] = 0.0
+                return (inp,) + input_[1:]
             return hook
 
         try:
+            layers = self._get_layers()
             for (layer_idx, head_idx) in heads_to_mask:
-                layer = self.model.model.layers[layer_idx]
+                layer = layers[layer_idx]
                 h = layer.self_attn.o_proj.register_forward_pre_hook(
-                    _make_output_zero_hook(head_idx)
+                    _make_pre_hook(head_idx)
                 )
                 hooks.append(h)
             result = self.evaluate(context_lengths, needle_positions, n_samples)
@@ -303,3 +324,32 @@ class NIAHEvaluator:
                 h.remove()
 
         return result
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _get_head_dim(self) -> int:
+        """Return per-head dimension."""
+        cfg = getattr(self.model, "config", None)
+        if cfg is not None:
+            if hasattr(cfg, "head_dim"):
+                return cfg.head_dim
+            try:
+                return cfg.hidden_size // cfg.num_attention_heads
+            except AttributeError:
+                pass
+        return 128
+
+    def _get_layers(self):
+        """Return model layer list, handling LLaMA / OLMo / Qwen variants."""
+        model_inner = getattr(self.model, "model", self.model)
+        for attr in ("layers", "transformer.blocks", "transformer.h", "decoder.layers"):
+            obj = model_inner
+            for part in attr.split("."):
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                return obj
+        raise AttributeError("Cannot locate layer list in model architecture.")

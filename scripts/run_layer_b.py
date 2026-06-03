@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import glob  # FIX #19: module-level import (was inside a function body)
 import json
 import logging
 import random
@@ -159,8 +160,6 @@ def process_checkpoint(
 def load_all_checkpoint_results(results_dir: Path) -> list[dict]:
     """Load all completed checkpoint result JSONs, sorted by step."""
     pattern = results_dir / "layer_b" / "checkpoint_*" / "results.json"
-    import glob
-
     paths = sorted(
         glob.glob(str(pattern)),
         key=lambda p: int(Path(p).parent.name.replace("checkpoint_", "")),

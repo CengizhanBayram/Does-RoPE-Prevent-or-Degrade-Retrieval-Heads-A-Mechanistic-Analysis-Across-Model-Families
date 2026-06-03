@@ -77,7 +77,7 @@ class ActivationPatcher:
         head_dim = self._get_head_dim()
 
         def _make_hook(proj_name: str):
-            def hook(module, input_, output: Tensor) -> Tensor:
+            def hook(module, input_: Any, output: Tensor) -> Tensor:
                 # output shape: (batch, seq_len, hidden_dim)
                 out = output.clone()
                 start = head_idx * head_dim
@@ -100,10 +100,17 @@ class ActivationPatcher:
                 h.remove()
 
     def _get_head_dim(self) -> int:
-        try:
-            return self.model.config.hidden_size // self.model.config.num_attention_heads
-        except AttributeError:
-            return 128  # safe fallback for 7B models
+        """Return per-head dimension, preferring explicit config field."""
+        cfg = getattr(self.model, "config", None)
+        if cfg is not None:
+            # Some models expose head_dim directly
+            if hasattr(cfg, "head_dim"):
+                return cfg.head_dim
+            try:
+                return cfg.hidden_size // cfg.num_attention_heads
+            except AttributeError:
+                pass
+        return 128  # safe fallback for 7B models
 
     # ------------------------------------------------------------------
     # NIAH accuracy under a patch condition
@@ -121,6 +128,9 @@ class ActivationPatcher:
         """
         Compute NIAH accuracy (fraction of samples where the code appears in output).
 
+        A NEW context manager is created for EACH sample so the generator is
+        never exhausted mid-loop.
+
         Args:
             samples: NIAH sample dicts.
             layer_idx: Layer to patch (None = no patch, i.e. baseline).
@@ -131,46 +141,63 @@ class ActivationPatcher:
         Returns:
             Accuracy in [0, 1].
         """
-        device = next(self.model.parameters()).device
-        correct = 0
-
-        ctx = (
-            self.patch_head(layer_idx, head_idx, dims_to_zero, mode)
-            if layer_idx is not None and head_idx is not None and dims_to_zero
-            else _null_context()
+        do_patch = (
+            layer_idx is not None
+            and head_idx is not None
+            and dims_to_zero is not None
+            and len(dims_to_zero) > 0
         )
+        device = next(
+            (p for p in self.model.parameters() if p.device.type != "meta"),
+            next(self.model.parameters()),
+        ).device
+        correct = 0
+        total = 0
 
         for sample in samples:
             input_ids = torch.tensor(
                 [sample["prompt_ids"]], dtype=torch.long, device=device
             )
             try:
+                # FIX #3: Create a fresh context manager for every sample.
+                # @contextmanager generators are single-use; reusing one causes
+                # GeneratorExit on the second iteration.
+                if do_patch:
+                    ctx = self.patch_head(layer_idx, head_idx, dims_to_zero, mode)
+                else:
+                    ctx = _null_context()
+
                 with ctx:
                     out = self.model.generate(
                         input_ids,
                         max_new_tokens=20,
                         do_sample=False,
-                        temperature=1.0,
                     )
+
+                generated_ids = out[0, input_ids.shape[1]:]
+                generated_text = self.tokenizer.decode(
+                    generated_ids, skip_special_tokens=True
+                )
+                if sample["code"] in generated_text:
+                    correct += 1
+                total += 1
+
             except RuntimeError as exc:
                 if "out of memory" in str(exc).lower():
                     logger.warning("OOM during patching eval; skipping sample.")
                     gc.collect()
                     torch.cuda.empty_cache()
-                    continue
-                raise
+                else:
+                    raise
+            finally:
+                # FIX #17-style: guard del so NameError can't happen
+                if "input_ids" in locals():
+                    del input_ids
+                if "out" in locals():
+                    del out
+                torch.cuda.empty_cache()
 
-            generated_ids = out[0, input_ids.shape[1] :]
-            generated_text = self.tokenizer.decode(
-                generated_ids, skip_special_tokens=True
-            )
-            if sample["code"] in generated_text:
-                correct += 1
-
-            del input_ids, out
-            torch.cuda.empty_cache()
-
-        return correct / len(samples) if samples else 0.0
+        return correct / total if total > 0 else 0.0
 
     # ------------------------------------------------------------------
     # Full experiment
@@ -189,15 +216,15 @@ class ActivationPatcher:
         Run three-condition activation patching for each retrieval head.
 
         Conditions per head:
-          - baseline: no patch
+          - baseline: no patch  (computed once, shared across all heads)
           - low_utility: zero k_dims dimensions with lowest L1 norm
           - random: zero k_dims randomly chosen dimensions (avg over 5 seeds)
           - high_utility: zero k_dims dimensions with highest L1 norm
 
         Args:
             retrieval_heads: List of (layer, head) tuples.
-            utility_scores: Dict from DimensionUtilityAnalyzer.compute_utility_scores()
-                            (must include "per_head_scalar" nested list).
+            utility_scores: Dict from DimensionUtilityAnalyzer (must contain
+                "_norms" ndarray or "per_head_scalar" nested list).
             samples: NIAH samples for evaluation.
             k_dims: Number of dimensions to zero. Defaults to self.k_dims.
             n_samples: Number of samples to use per condition.
@@ -210,21 +237,21 @@ class ActivationPatcher:
         seeds = random_seeds or list(range(5))
         eval_samples = samples[:n_samples]
 
-        # Retrieve full per-head-per-dim norms; utility_scores["per_head_scalar"]
-        # is (n_layers, n_heads) but we need per-dim norms from the raw norms matrix.
-        # We accept the norms matrix separately via utility_scores["_norms"] if present.
         norms_matrix: np.ndarray | None = utility_scores.get("_norms")
+
+        # FIX #11: Compute baseline ONCE outside the head loop.
+        logger.info("Computing baseline accuracy (no patch) …")
+        baseline_acc = self._evaluate_accuracy(eval_samples)
+        logger.info("Baseline accuracy: %.3f", baseline_acc)
 
         results: dict = {}
 
         for (layer_idx, head_idx) in retrieval_heads:
             logger.info("Patching experiment: layer=%d head=%d", layer_idx, head_idx)
 
-            # Get per-dimension norms for this head
             if norms_matrix is not None:
                 head_norms = norms_matrix[layer_idx, head_idx]  # (head_dim,)
             else:
-                # Fall back: use per_head_scalar repeated (coarse)
                 scalar_grid = np.array(utility_scores["per_head_scalar"])
                 head_norms = np.full(
                     self._get_head_dim(),
@@ -238,26 +265,17 @@ class ActivationPatcher:
             low_dims = sorted_by_utility[:k].tolist()
             high_dims = sorted_by_utility[-k:].tolist()
 
-            # Baseline
-            baseline_acc = self._evaluate_accuracy(eval_samples)
-
-            # Low-utility zeroing
             low_acc = self._evaluate_accuracy(
                 eval_samples, layer_idx, head_idx, low_dims
             )
-
-            # High-utility zeroing
             high_acc = self._evaluate_accuracy(
                 eval_samples, layer_idx, head_idx, high_dims
             )
 
-            # Random zeroing (average over seeds)
-            random_accs = []
+            random_accs: list[float] = []
             for seed in seeds:
                 rng = np.random.RandomState(seed)
-                rand_dims = rng.choice(
-                    dim_indices, size=k, replace=False
-                ).tolist()
+                rand_dims = rng.choice(dim_indices, size=k, replace=False).tolist()
                 acc = self._evaluate_accuracy(
                     eval_samples, layer_idx, head_idx, rand_dims
                 )
@@ -277,10 +295,7 @@ class ActivationPatcher:
             }
             logger.info(
                 "  baseline=%.3f  low=%.3f  rand=%.3f  high=%.3f",
-                baseline_acc,
-                low_acc,
-                random_acc,
-                high_acc,
+                baseline_acc, low_acc, random_acc, high_acc,
             )
 
         return results
@@ -296,10 +311,8 @@ class ActivationPatcher:
         causal_effect = (baseline - low_utility) - (baseline - random)
                       = random - low_utility
 
-        Positive value → removing low-utility dims hurts more than random removal
-        (unexpected; low-utility dims are load-bearing).
-        Negative value → removing low-utility dims hurts less than random removal
-        (H2-consistent; these dims are already unused).
+        Negative → low-utility dims are already unused (H2-consistent).
+        Positive → low-utility dims are load-bearing (unexpected).
 
         Args:
             results: Output of run_patching_experiment().
@@ -315,7 +328,7 @@ class ActivationPatcher:
             rand = data["random"]
             high = data["high_utility"]
 
-            causal_effect = rand - low  # negative → H2
+            causal_effect = rand - low
             relative_drop_low = (baseline - low) / (baseline + 1e-8)
             relative_drop_high = (baseline - high) / (baseline + 1e-8)
 
@@ -336,12 +349,10 @@ class ActivationPatcher:
 
 
 # ---------------------------------------------------------------------------
-# Helper: null context manager
+# Helper: null context manager (module-level, importable)
 # ---------------------------------------------------------------------------
 
-from contextlib import contextmanager as _cm
-
-
-@_cm
-def _null_context():
+@contextmanager
+def _null_context() -> Generator[None, None, None]:
+    """No-op context manager used when no patch is applied."""
     yield

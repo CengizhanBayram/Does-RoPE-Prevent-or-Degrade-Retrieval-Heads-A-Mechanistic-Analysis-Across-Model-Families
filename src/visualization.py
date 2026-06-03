@@ -8,19 +8,19 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
 
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend
+# Use non-interactive Agg backend before pyplot is imported.
+# If pyplot was already imported elsewhere, this call is a no-op but harmless.
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import numpy as np
 import seaborn as sns
 
 logger = logging.getLogger(__name__)
 
-# Consistent style
 sns.set_theme(style="whitegrid", font_scale=1.1)
+
 PALETTE = {
     "llama3": "#1f77b4",
     "llama2": "#ff7f0e",
@@ -29,6 +29,8 @@ PALETTE = {
     "retrieval": "#d62728",
     "non_retrieval": "#1f77b4",
 }
+# FIX #9: removed unused `layer_colors` local variable that appeared in the
+# original scatter function. Markers dict kept here for reference.
 MARKERS = {"llama3": "o", "llama2": "s", "qwen": "^", "olmo": "D"}
 
 
@@ -60,8 +62,6 @@ def plot_retrieval_vs_utility_scatter(
             - "retrieval_scores": nested list (n_layers × n_heads)
             - "dimension_utility.per_head_scalar": nested list (n_layers × n_heads)
             - "retrieval_heads": list of [layer, head] pairs
-            - "statistical_tests.pearson_r": float
-            - "statistical_tests.pearson_p": float
         save_path: Output file path.
         dpi: Output resolution.
     """
@@ -69,7 +69,9 @@ def plot_retrieval_vs_utility_scatter(
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    all_x, all_y = [], []
+    all_x: list[float] = []
+    all_y: list[float] = []
+    last_sc = None  # keep reference for colorbar
 
     for model_name, res in results.items():
         scores = np.array(res["retrieval_scores"])
@@ -77,16 +79,14 @@ def plot_retrieval_vs_utility_scatter(
         retrieval_set = {(r[0], r[1]) for r in res["retrieval_heads"]}
 
         n_layers, n_heads = scores.shape
-        layer_colors = np.arange(n_layers)
-
         x_vals = scores.flatten()
         y_vals = utility.flatten()
         all_x.extend(x_vals.tolist())
         all_y.extend(y_vals.tolist())
 
-        # Color by layer depth
+        # FIX #9: layer_indices replaces the unused layer_colors variable.
         layer_indices = np.repeat(np.arange(n_layers), n_heads)
-        sc = ax.scatter(
+        last_sc = ax.scatter(
             x_vals,
             y_vals,
             c=layer_indices,
@@ -97,17 +97,11 @@ def plot_retrieval_vs_utility_scatter(
             label=model_name,
         )
 
-        # Red outline for retrieval heads
-        ret_x, ret_y = [], []
-        for l in range(n_layers):
-            for h in range(n_heads):
-                if (l, h) in retrieval_set:
-                    ret_x.append(scores[l, h])
-                    ret_y.append(utility[l, h])
+        ret_x = [scores[l, h] for l, h in retrieval_set if l < n_layers and h < n_heads]
+        ret_y = [utility[l, h] for l, h in retrieval_set if l < n_layers and h < n_heads]
         if ret_x:
             ax.scatter(
-                ret_x,
-                ret_y,
+                ret_x, ret_y,
                 facecolors="none",
                 edgecolors="red",
                 linewidths=1.5,
@@ -115,7 +109,6 @@ def plot_retrieval_vs_utility_scatter(
                 zorder=5,
             )
 
-    # Regression line over all models combined
     if len(all_x) > 2:
         slope, intercept, r_val, p_val, _ = sp_stats.linregress(all_x, all_y)
         x_line = np.linspace(min(all_x), max(all_x), 200)
@@ -128,12 +121,13 @@ def plot_retrieval_vs_utility_scatter(
             label=f"OLS  r={r_val:.3f}, p={p_val:.3e}",
         )
 
-    plt.colorbar(sc, ax=ax, label="Layer depth")
+    if last_sc is not None:
+        plt.colorbar(last_sc, ax=ax, label="Layer depth")
+
     ax.set_xlabel("Retrieval score (NIAH hit rate)", fontsize=12)
     ax.set_ylabel("Mean dimension utility (L1 norm)", fontsize=12)
     ax.set_title("Figure 1 — Retrieval Score vs. Dimension Utility", fontsize=13)
     ax.legend(fontsize=9)
-
     _save(fig, save_path, dpi=dpi)
 
 
@@ -154,7 +148,7 @@ def plot_dimension_utility_profile(
 
     Args:
         results: Dict keyed by model name. Each value must contain
-            "dimension_utility.frequency_profile" with keys:
+            dimension_utility.frequency_profile with keys:
             retrieval_mean, retrieval_std, non_retrieval_mean, non_retrieval_std.
         save_path: Output file path.
         dpi: Output resolution.
@@ -180,7 +174,8 @@ def plot_dimension_utility_profile(
         ax.fill_between(x, ret_mean - ret_std, ret_mean + ret_std, alpha=0.2, color=PALETTE["retrieval"])
 
         theta = prof.get("theta", "?")
-        ax.set_title(f"{model_name}\n(θ={theta:.0f})", fontsize=11)
+        theta_str = f"{theta:.0f}" if isinstance(theta, (int, float)) else str(theta)
+        ax.set_title(f"{model_name}\n(θ={theta_str})", fontsize=11)
         ax.set_xlabel("Dimension index (low → high RoPE freq.)", fontsize=9)
         if ax is axes[0]:
             ax.set_ylabel("Normalized L1 norm", fontsize=9)
@@ -200,21 +195,19 @@ def plot_olmo_training_dynamics(
     dpi: int = 300,
 ) -> None:
     """
-    Dual-axis line plot of retrieval head count and dimension utility over training.
+    Dual-axis line plot of retrieval head count and mean dimension utility over training.
 
     Args:
         checkpoint_results: List of per-checkpoint result dicts, each with:
             - "step": int
             - "summary.n_retrieval_heads": int
-            - "dimension_utility.per_head_scalar": nested list (n_layers × n_heads)
-                whose top-20 values are averaged for the right axis.
+            - "dimension_utility.per_head_scalar": nested list (n_layers × n_heads).
         save_path: Output file path.
         dpi: Output resolution.
     """
     steps = [r["step"] for r in checkpoint_results]
     n_heads_list = [r["summary"]["n_retrieval_heads"] for r in checkpoint_results]
 
-    # Top-20 mean utility
     top20_utility = []
     for r in checkpoint_results:
         scalar_grid = np.array(r["dimension_utility"]["per_head_scalar"]).flatten()
@@ -230,7 +223,6 @@ def plot_olmo_training_dynamics(
     ax1.plot(steps, n_heads_list, color=color_ret, linewidth=2, marker="o", markersize=4, label="# Retrieval heads")
     ax2.plot(steps, top20_utility, color=color_util, linewidth=2, marker="s", markersize=4, linestyle="--", label="Top-20 mean utility")
 
-    # Annotate crystallization step: max discrete derivative
     if len(n_heads_list) > 2:
         diffs = np.diff(n_heads_list)
         cryst_idx = int(np.argmax(diffs)) + 1
@@ -244,7 +236,6 @@ def plot_olmo_training_dynamics(
             fontsize=8,
         )
 
-        # Compute lag: at crystallization step, what is the utility trend?
         util_at_cryst = top20_utility[cryst_idx]
         util_before = top20_utility[max(0, cryst_idx - 1)]
         direction = "decreasing" if util_at_cryst < util_before else "increasing/stable"
@@ -252,6 +243,8 @@ def plot_olmo_training_dynamics(
             f"Figure 3 — OLMo-2 Training Dynamics\nUtility at crystallization: {direction}",
             fontsize=12,
         )
+    else:
+        ax1.set_title("Figure 3 — OLMo-2 Training Dynamics", fontsize=12)
 
     ax1.set_xlabel("Training step", fontsize=11)
     ax1.set_ylabel("# Retrieval heads", color=color_ret, fontsize=11)
@@ -287,44 +280,38 @@ def plot_theta_comparison_heatmaps(
     """
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    datasets = [
+    model_pairs = [
         ("LLaMA-2 (θ=10K)", llama2_results),
         ("LLaMA-3.1 (θ=500K)", llama3_results),
     ]
-    metrics = ["retrieval_scores", "per_head_utility"]
+    # FIX #10: removed unused `metrics` variable; data_keys are now inline.
+    row_specs = [
+        ("Retrieval Score",                "retrieval_scores",      "YlOrRd"),
+        ("Dimension Utility (mean L1 norm)", "per_head_utility",   "viridis"),
+    ]
 
-    # Compute global color ranges for fair comparison
-    all_ret = [
-        np.array(r["retrieval_scores"]) for _, r in datasets
-    ]
-    all_util = [
-        np.array(r["dimension_utility"]["per_head_scalar"]) for _, r in datasets
-    ]
+    all_ret = [np.array(r["retrieval_scores"]) for _, r in model_pairs]
+    all_util = [np.array(r["dimension_utility"]["per_head_scalar"]) for _, r in model_pairs]
     vmin_ret, vmax_ret = min(a.min() for a in all_ret), max(a.max() for a in all_ret)
     vmin_util, vmax_util = min(a.min() for a in all_util), max(a.max() for a in all_util)
-
-    cmaps = ["YlOrRd", "viridis"]
     vmins = [vmin_ret, vmin_util]
     vmaxs = [vmax_ret, vmax_util]
-    titles = ["Retrieval Score", "Dimension Utility (mean L1 norm)"]
 
-    for col, (model_label, res) in enumerate(datasets):
-        for row, (metric_title, data_key, cmap, vmin, vmax) in enumerate(
-            zip(titles, metrics, cmaps, vmins, vmaxs)
-        ):
+    for col, (model_label, res) in enumerate(model_pairs):
+        for row, (metric_title, data_key, cmap) in enumerate(row_specs):
             ax = axes[row, col]
-            if data_key == "retrieval_scores":
-                mat = np.array(res["retrieval_scores"])
-            else:
-                mat = np.array(res["dimension_utility"]["per_head_scalar"])
-
+            mat = (
+                np.array(res["retrieval_scores"])
+                if data_key == "retrieval_scores"
+                else np.array(res["dimension_utility"]["per_head_scalar"])
+            )
             im = ax.imshow(
                 mat.T,
                 aspect="auto",
                 origin="lower",
                 cmap=cmap,
-                vmin=vmin,
-                vmax=vmax,
+                vmin=vmins[row],
+                vmax=vmaxs[row],
                 interpolation="nearest",
             )
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -365,15 +352,17 @@ def plot_activation_patching_results(
     for data in patching_results.values():
         for c in conditions:
             if c in data:
-                acc_per_cond[c].append(data[c])
+                acc_per_cond[c].append(float(data[c]))
 
     means = [np.mean(acc_per_cond[c]) if acc_per_cond[c] else 0.0 for c in conditions]
     stds = [np.std(acc_per_cond[c]) if acc_per_cond[c] else 0.0 for c in conditions]
 
     fig, ax = plt.subplots(figsize=(8, 5))
     x = np.arange(len(conditions))
-    bars = ax.bar(x, means, yerr=stds, capsize=5, color=colors, alpha=0.85, edgecolor="black", linewidth=0.8)
-
+    bars = ax.bar(
+        x, means, yerr=stds, capsize=5,
+        color=colors, alpha=0.85, edgecolor="black", linewidth=0.8,
+    )
     ax.set_xticks(x)
     ax.set_xticklabels(condition_labels, fontsize=10)
     ax.set_ylabel("NIAH Accuracy", fontsize=11)
@@ -385,12 +374,9 @@ def plot_activation_patching_results(
             bar.get_x() + bar.get_width() / 2,
             bar.get_height() + 0.02,
             f"{mean_val:.3f}",
-            ha="center",
-            va="bottom",
-            fontsize=9,
+            ha="center", va="bottom", fontsize=9,
         )
 
-    # Causal effect annotation
     if acc_per_cond["baseline"] and acc_per_cond["low_utility"] and acc_per_cond["random"]:
         ce = np.mean(acc_per_cond["random"]) - np.mean(acc_per_cond["low_utility"])
         direction = "H2 (low-util unused)" if ce < 0 else "unexpected (low-util load-bearing)"
@@ -398,9 +384,7 @@ def plot_activation_patching_results(
             0.98, 0.95,
             f"Causal effect = {ce:.3f}\n→ {direction}",
             transform=ax.transAxes,
-            ha="right",
-            va="top",
-            fontsize=8,
+            ha="right", va="top", fontsize=8,
             bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray"),
         )
 
@@ -420,9 +404,7 @@ def plot_niah_comparison(
     dpi: int = 300,
 ) -> None:
     """
-    Side-by-side NIAH heatmaps: normal vs. retrieval-heads-masked.
-
-    An optional difference map (masked - normal) is also shown.
+    Side-by-side NIAH heatmaps: normal vs. retrieval-heads-masked, plus diff map.
 
     Args:
         normal_acc: (n_lengths, n_positions) accuracy matrix without masking.
@@ -445,18 +427,15 @@ def plot_niah_comparison(
     y_labels = [str(cl) for cl in context_lengths]
 
     for ax, title, mat, cmap, vmin, vmax in zip(axes, titles, mats, cmaps, vmins, vmaxs):
-        im = sns.heatmap(
+        sns.heatmap(
             mat,
             ax=ax,
-            vmin=vmin,
-            vmax=vmax,
+            vmin=vmin, vmax=vmax,
             cmap=cmap,
-            annot=True,
-            fmt=".2f",
+            annot=True, fmt=".2f",
             xticklabels=x_labels,
             yticklabels=y_labels,
-            linewidths=0.3,
-            linecolor="gray",
+            linewidths=0.3, linecolor="gray",
             cbar=True,
         )
         ax.set_title(title, fontsize=11)

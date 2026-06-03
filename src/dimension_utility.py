@@ -35,10 +35,9 @@ class DimensionUtilityAnalyzer:
         self.model = model
         self.config = config
 
-        # Infer theta from model config; fall back to 10000 (LLaMA-2 default)
-        self.theta: float = float(
-            getattr(getattr(model, "config", None), "rope_theta", 10000.0)
-        )
+        # FIX #14: Robust rope_theta extraction across model families.
+        # Qwen2.5 stores it as rope_theta; some models use rope_scaling.rope_theta.
+        self.theta: float = self._extract_rope_theta(model)
         logger.info("RoPE theta = %.0f", self.theta)
 
         try:
@@ -51,13 +50,16 @@ class DimensionUtilityAnalyzer:
                 "num_attention_heads, hidden_size)."
             ) from exc
 
-        # head_dim = hidden_dim / n_heads (integer)
-        self.head_dim: int = self.hidden_dim // self.n_heads
+        # FIX #5 / #14: Prefer explicit head_dim from config when available.
+        # Avoids integer-division errors when hidden_size % n_heads != 0.
+        if hasattr(model.config, "head_dim"):
+            self.head_dim: int = model.config.head_dim
+        else:
+            self.head_dim = self.hidden_dim // self.n_heads
 
-        # Pre-compute RoPE frequency order (ascending frequency)
+        # Pre-compute RoPE frequency order (ascending frequency).
         # RoPE applies frequencies to *pairs* of dimensions: dim 2i and 2i+1
         # share frequency theta^(-2i/head_dim).
-        # We assign each of the head_dim positions its corresponding frequency.
         half = self.head_dim // 2
         freqs = np.array(
             [self.theta ** (-2 * i / self.head_dim) for i in range(half)],
@@ -67,8 +69,44 @@ class DimensionUtilityAnalyzer:
         freq_per_dim = np.repeat(freqs, 2)  # length = head_dim
         # Argsort ascending → index 0 is the *lowest* frequency dimension
         self.freq_order: np.ndarray = np.argsort(freq_per_dim)
-        # Also store the frequency value for each sorted position
         self.freq_values_sorted: np.ndarray = freq_per_dim[self.freq_order]
+
+    @staticmethod
+    def _extract_rope_theta(model: Any) -> float:
+        """Extract rope_theta from model config, handling multiple attribute paths."""
+        cfg = getattr(model, "config", None)
+        if cfg is None:
+            return 10000.0
+
+        # Direct attribute (most models: LLaMA, OLMo, Qwen2.5)
+        if hasattr(cfg, "rope_theta"):
+            return float(cfg.rope_theta)
+
+        # Nested under rope_scaling dict
+        rope_scaling = getattr(cfg, "rope_scaling", None)
+        if isinstance(rope_scaling, dict):
+            for key in ("rope_theta", "base"):
+                if key in rope_scaling:
+                    return float(rope_scaling[key])
+
+        logger.warning(
+            "Could not find rope_theta in model config; defaulting to 10000. "
+            "Frequency profile may be inaccurate."
+        )
+        return 10000.0
+
+    def _get_layers(self):
+        """Return model layer list, handling multiple architecture variants."""
+        model_inner = getattr(self.model, "model", self.model)
+        for attr in ("layers", "transformer.blocks", "transformer.h", "decoder.layers"):
+            obj = model_inner
+            for part in attr.split("."):
+                obj = getattr(obj, part, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                return obj
+        raise AttributeError("Cannot locate layer list in model architecture.")
 
     # ------------------------------------------------------------------
     # Core computation
@@ -79,16 +117,17 @@ class DimensionUtilityAnalyzer:
         Compute per-dimension L1 norms of the Q projection for every head.
 
         For each layer the q_proj weight matrix has shape
-        (hidden_dim, hidden_dim). We reshape it to (n_heads, head_dim, hidden_dim)
-        then take the L1 norm along the input-feature axis (axis=-1), yielding
-        a (n_heads, head_dim) matrix of norms.
+        (n_q_heads * head_dim, hidden_dim). We reshape it to
+        (n_q_heads, head_dim, hidden_dim) then take the L1 norm along
+        the input-feature axis (axis=-1), yielding (n_q_heads, head_dim).
 
         Returns:
             np.ndarray of shape (n_layers, n_heads, head_dim), float32.
         """
+        layers = self._get_layers()
         all_norms: list[np.ndarray] = []
 
-        for layer_idx, layer in enumerate(self.model.model.layers):
+        for layer_idx, layer in enumerate(layers):
             try:
                 q_proj = layer.self_attn.q_proj
             except AttributeError:
@@ -100,25 +139,39 @@ class DimensionUtilityAnalyzer:
                 )
                 continue
 
-            weight = q_proj.weight.detach().cpu().float()  # (hidden_dim, hidden_dim)
-
-            # Handle GQA / MQA: q_proj output dim may differ from hidden_dim
+            weight = q_proj.weight.detach().cpu().float()  # (out_dim, in_dim)
             out_dim = weight.shape[0]
+
+            # FIX #5: q_proj always projects to ALL Q heads, so n_q_heads = out_dim // head_dim.
+            # This equals self.n_heads for standard models and remains correct for GQA
+            # (where n_kv_heads < n_heads but q_proj still outputs n_heads * head_dim).
             n_q_heads = out_dim // self.head_dim
+            if n_q_heads == 0:
+                logger.warning(
+                    "Layer %d: q_proj out_dim=%d < head_dim=%d; inserting zeros.",
+                    layer_idx, out_dim, self.head_dim,
+                )
+                all_norms.append(
+                    np.zeros((self.n_heads, self.head_dim), dtype=np.float32)
+                )
+                del weight
+                continue
 
             # Reshape to (n_q_heads, head_dim, in_features)
             w = weight.view(n_q_heads, self.head_dim, -1)
-            # L1 norm over input features: (n_q_heads, head_dim)
+            # L1 norm over input features → (n_q_heads, head_dim)
             norms = w.abs().sum(dim=-1).numpy().astype(np.float32)
-
-            # If GQA has fewer Q heads than n_heads, tile to match
-            if n_q_heads < self.n_heads:
-                repeats = self.n_heads // n_q_heads
-                norms = np.tile(norms, (repeats, 1))
-
-            all_norms.append(norms[: self.n_heads])
-
             del weight, w
+
+            if n_q_heads < self.n_heads:
+                # Should not happen for q_proj, but guard anyway.
+                # Repeat groups to match n_heads (correct for any GQA structure).
+                repeat_factor = self.n_heads // n_q_heads
+                norms = np.repeat(norms, repeat_factor, axis=0)
+            elif n_q_heads > self.n_heads:
+                norms = norms[: self.n_heads]
+
+            all_norms.append(norms)
 
         result = np.stack(all_norms, axis=0)  # (n_layers, n_heads, head_dim)
         logger.info(
@@ -151,19 +204,17 @@ class DimensionUtilityAnalyzer:
             non_retrieval_std, t_statistic, p_value, per_head_scalar,
             n_retrieval, n_non_retrieval.
         """
-        # per_head_scalar: (n_layers, n_heads) — average utility across dims
         per_head_scalar = norms.mean(axis=-1)  # (n_layers, n_heads)
-
         retrieval_set = set(retrieval_heads)
         n_layers, n_heads = per_head_scalar.shape
 
         retrieval_vals: list[float] = []
         non_retrieval_vals: list[float] = []
 
-        for l in range(n_layers):
-            for h in range(n_heads):
-                val = float(per_head_scalar[l, h])
-                if (l, h) in retrieval_set:
+        for layer in range(n_layers):
+            for head in range(n_heads):
+                val = float(per_head_scalar[layer, head])
+                if (layer, head) in retrieval_set:
                     retrieval_vals.append(val)
                 else:
                     non_retrieval_vals.append(val)
@@ -214,15 +265,23 @@ class DimensionUtilityAnalyzer:
         per_head_utility = norms.mean(axis=-1).flatten()
         per_head_retrieval = retrieval_scores.flatten()
 
+        if len(np.unique(per_head_retrieval)) < 2 or len(np.unique(per_head_utility)) < 2:
+            logger.warning(
+                "Constant array detected; correlation is undefined. Returning NaN."
+            )
+            return {
+                "pearson_r": float("nan"),
+                "pearson_p": float("nan"),
+                "spearman_rho": float("nan"),
+                "spearman_p": float("nan"),
+            }
+
         pearson_r, pearson_p = stats.pearsonr(per_head_retrieval, per_head_utility)
         spearman_rho, spearman_p = stats.spearmanr(per_head_retrieval, per_head_utility)
 
         logger.info(
             "Correlation — Pearson r=%.3f (p=%.4f), Spearman ρ=%.3f (p=%.4f)",
-            pearson_r,
-            pearson_p,
-            spearman_rho,
-            spearman_p,
+            pearson_r, pearson_p, spearman_rho, spearman_p,
         )
         return {
             "pearson_r": float(pearson_r),
@@ -261,28 +320,42 @@ class DimensionUtilityAnalyzer:
         retrieval_norms: list[np.ndarray] = []
         non_retrieval_norms: list[np.ndarray] = []
 
-        for l in range(n_layers):
-            for h in range(n_heads):
-                norm_vec = norms[l, h, :]  # (head_dim,)
-                # Sort by frequency order
+        for layer in range(n_layers):
+            for head in range(n_heads):
+                norm_vec = norms[layer, head, :]
                 sorted_norm = norm_vec[self.freq_order]
-                if (l, h) in retrieval_set:
+                if (layer, head) in retrieval_set:
                     retrieval_norms.append(sorted_norm)
                 else:
                     non_retrieval_norms.append(sorted_norm)
+
+        # FIX #8: Warn when retrieval_heads is empty — silent zeros would
+        # produce a false H1 signal on the frequency profile plot.
+        if not retrieval_norms:
+            logger.warning(
+                "dimension_profile_by_frequency: no retrieval heads found. "
+                "Retrieval curve will be all zeros — do not interpret as H1 evidence. "
+                "Consider lowering score_threshold."
+            )
 
         def _stats(arr_list: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
             if not arr_list:
                 z = np.zeros(head_dim, dtype=np.float32)
                 return z, z
-            mat = np.stack(arr_list, axis=0)  # (N, head_dim)
+            mat = np.stack(arr_list, axis=0)
             return mat.mean(axis=0).astype(np.float32), mat.std(axis=0).astype(np.float32)
 
         ret_mean, ret_std = _stats(retrieval_norms)
         non_ret_mean, non_ret_std = _stats(non_retrieval_norms)
 
-        # Normalize so both groups are comparable on [0, 1]
-        all_max = max(ret_mean.max(), non_ret_mean.max(), 1e-8)
+        # Normalize so both groups are comparable on [0, 1].
+        # FIX #8: Use only non_retrieval max when retrieval is empty, to avoid
+        # dividing by 0 from an all-zeros ret_mean.
+        all_max = max(
+            float(ret_mean.max()) if retrieval_norms else 0.0,
+            float(non_ret_mean.max()),
+            1e-8,
+        )
         ret_mean_norm = ret_mean / all_max
         non_ret_mean_norm = non_ret_mean / all_max
 
