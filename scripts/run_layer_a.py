@@ -31,7 +31,10 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.dimension_utility import DimensionUtilityAnalyzer
+from src.model_loader import load_model as _load_model_shared
+from src.repro import capture_environment, set_determinism
 from src.retrieval_head_detector import RetrievalHeadDetector
+from src.stats_utils import benjamini_hochberg
 from src.visualization import (
     plot_dimension_utility_profile,
     plot_retrieval_vs_utility_scatter,
@@ -85,42 +88,9 @@ def _determine_hypothesis(stats: dict) -> str:
     return "inconclusive"
 
 
-def _load_model(model_name: str, model_cfg: dict):
-    """Load a model with optional 8-bit quantization."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
-    hf_id = model_cfg["hf_id"]
-    load_8bit = model_cfg.get("load_in_8bit", True)
-
-    try:
-        import bitsandbytes  # noqa: F401
-        has_bnb = True
-    except ImportError:
-        has_bnb = False
-        if load_8bit:
-            logger.warning("bitsandbytes not found; loading in fp16.")
-
-    tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    kwargs: dict = {"device_map": "auto", "trust_remote_code": True}
-    if load_8bit and has_bnb:
-        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-    else:
-        kwargs["torch_dtype"] = torch.float16
-
-    logger.info("Loading %s (%s) …", model_name, hf_id)
-    model = AutoModelForCausalLM.from_pretrained(hf_id, **kwargs)
-    model.eval()
-
-    if torch.cuda.is_available():
-        logger.info(
-            "VRAM after load: %.1f / %.1f GB",
-            torch.cuda.memory_allocated() / 1e9,
-            torch.cuda.get_device_properties(0).total_memory / 1e9,
-        )
-    return model, tokenizer
+def _load_model(model_name: str, model_cfg: dict, load_in_8bit: bool | None = None):
+    """Load a model at its pinned revision (delegates to src.model_loader)."""
+    return _load_model_shared(model_cfg, model_name, load_in_8bit=load_in_8bit)
 
 
 def _unload_model(model) -> None:
@@ -141,13 +111,21 @@ def run_analysis(
     n_samples: int,
     results_dir: Path,
     seed: int = 42,
+    load_in_8bit: bool | None = None,
+    persist: bool = True,
 ) -> dict:
     """
     Run the full Layer-A pipeline for a single model.
 
-    Returns the result dict (also written to disk).
+    Args:
+        persist: When True, write results.json and norms.npy to disk. Set False
+            for the extra seeds of a multi-seed run (item B3) so the primary
+            seed's artifacts (consumed by Layer D) are not overwritten.
+
+    Returns the result dict (also written to disk when persist=True).
     """
-    _set_seeds(seed)
+    strict = config.get("reproducibility", {}).get("strict_determinism", False)
+    set_determinism(seed, strict=strict)
     out_dir = results_dir / "layer_a" / model_name
     out_dir.mkdir(parents=True, exist_ok=True)
     figures_dir = out_dir / "figures"
@@ -160,7 +138,7 @@ def run_analysis(
     fig_fmt: str = config.get("output", {}).get("figure_format", "pdf")
     fig_dpi: int = config.get("output", {}).get("figures_dpi", 300)
 
-    model, tokenizer = _load_model(model_name, model_cfg)
+    model, tokenizer = _load_model(model_name, model_cfg, load_in_8bit=load_in_8bit)
 
     # --- Retrieval head detection ---
     logger.info("[%s] Generating NIAH samples …", model_name)
@@ -193,19 +171,36 @@ def run_analysis(
     stat_tests = {
         "retrieval_mean_utility": utility_stats["retrieval_mean"],
         "non_retrieval_mean_utility": utility_stats["non_retrieval_mean"],
+        "retrieval_std_utility": utility_stats["retrieval_std"],
+        "non_retrieval_std_utility": utility_stats["non_retrieval_std"],
         "t_statistic": utility_stats["t_statistic"],
         "p_value": utility_stats["p_value"],
+        "cohens_d": utility_stats["cohens_d"],
+        "mean_diff": utility_stats["mean_diff"],
+        "ci_low": utility_stats["ci_low"],
+        "ci_high": utility_stats["ci_high"],
+        "clustered_permutation_p": utility_stats["clustered_permutation_p"],
         "pearson_r": correlation["pearson_r"],
         "pearson_p": correlation["pearson_p"],
         "spearman_rho": correlation["spearman_rho"],
         "spearman_p": correlation["spearman_p"],
     }
 
+    actual_lengths = [s["actual_token_length"] for s in samples] if samples else []
+
     result = {
         "model": model_name,
         "timestamp": datetime.utcnow().isoformat(),
         "seed": seed,
-        "hardware": _hardware_info(),
+        "load_in_8bit": (model_cfg.get("load_in_8bit", True)
+                         if load_in_8bit is None else load_in_8bit),
+        "n_samples_generated": len(samples),
+        "actual_token_length": {
+            "mean": float(np.mean(actual_lengths)) if actual_lengths else None,
+            "min": int(np.min(actual_lengths)) if actual_lengths else None,
+            "max": int(np.max(actual_lengths)) if actual_lengths else None,
+        },
+        "environment": capture_environment(),
         "retrieval_heads": retrieval_heads,
         "retrieval_scores": scores.tolist(),
         "dimension_utility": {
@@ -221,14 +216,13 @@ def run_analysis(
         },
     }
 
-    # Save result JSON
-    result_path = out_dir / "results.json"
-    with open(result_path, "w") as f:
-        json.dump(result, f, indent=2)
-    logger.info("[%s] Results saved to %s", model_name, result_path)
-
-    # Save norms for activation patching
-    np.save(out_dir / "norms.npy", norms)
+    if persist:
+        result_path = out_dir / "results.json"
+        with open(result_path, "w") as f:
+            json.dump(result, f, indent=2)
+        logger.info("[%s] Results saved to %s", model_name, result_path)
+        # Save norms for activation patching (Layer D)
+        np.save(out_dir / "norms.npy", norms)
 
     _unload_model(model)
 
@@ -310,8 +304,47 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--n_samples", type=int, default=None, help="Override n_samples from config.")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Path to config.yaml.")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=42, help="Single seed (ignored if --seeds given).")
+    parser.add_argument(
+        "--seeds", type=int, nargs="+", default=None,
+        help="Multiple seeds for variance estimation (item B3). "
+             "Defaults to config niah.seeds, else [--seed].",
+    )
+    parser.add_argument(
+        "--no_8bit", action="store_true",
+        help="Load models in fp16 instead of 8-bit (quantization ablation, item A2).",
+    )
     return parser.parse_args()
+
+
+def _aggregate_seed_summaries(per_seed: list[dict]) -> dict:
+    """Mean ± SD of key metrics across seeds (item B3)."""
+    def _col(path: tuple[str, ...]) -> list[float]:
+        out = []
+        for r in per_seed:
+            v: Any = r
+            for k in path:
+                v = v[k]
+            if v is not None and v == v:  # skip None/NaN
+                out.append(float(v))
+        return out
+
+    metrics = {
+        "n_retrieval_heads": ("summary", "n_retrieval_heads"),
+        "retrieval_fraction": ("summary", "retrieval_fraction"),
+        "cohens_d": ("statistical_tests", "cohens_d"),
+        "spearman_rho": ("statistical_tests", "spearman_rho"),
+        "clustered_permutation_p": ("statistical_tests", "clustered_permutation_p"),
+    }
+    agg: dict = {"seeds": [r["seed"] for r in per_seed], "n_seeds": len(per_seed)}
+    for name, path in metrics.items():
+        vals = _col(path)
+        agg[name] = {
+            "mean": float(np.mean(vals)) if vals else None,
+            "std": float(np.std(vals, ddof=1)) if len(vals) > 1 else None,
+            "values": vals,
+        }
+    return agg
 
 
 def main() -> None:
@@ -324,6 +357,10 @@ def main() -> None:
     n_samples = args.n_samples or config["niah"]["n_samples"]
     fig_dpi = config.get("output", {}).get("figures_dpi", 300)
     fig_fmt = config.get("output", {}).get("figure_format", "pdf")
+    load_in_8bit = False if args.no_8bit else None  # None → use per-model config
+
+    seeds = args.seeds or config["niah"].get("seeds") or [args.seed]
+    logger.info("Running with seeds: %s", seeds)
 
     model_keys = (
         list(config["models"].keys())
@@ -331,29 +368,71 @@ def main() -> None:
         else [args.model]
     )
 
-    all_results: dict[str, dict] = {}
+    all_results: dict[str, dict] = {}  # primary-seed result per model (for figures)
 
     for model_name in model_keys:
         if model_name not in config["models"]:
             logger.error("Model '%s' not found in config.", model_name)
             continue
         logger.info("=" * 60)
-        logger.info("Starting analysis: %s", model_name)
+        logger.info("Starting analysis: %s (seeds=%s)", model_name, seeds)
         logger.info("=" * 60)
-        try:
-            res = run_analysis(
-                model_name=model_name,
-                model_cfg=config["models"][model_name],
-                config=config,
-                n_samples=n_samples,
-                results_dir=results_dir,
-                seed=args.seed,
+
+        per_seed: list[dict] = []
+        for idx, seed in enumerate(seeds):
+            try:
+                res = run_analysis(
+                    model_name=model_name,
+                    model_cfg=config["models"][model_name],
+                    config=config,
+                    n_samples=n_samples,
+                    results_dir=results_dir,
+                    seed=seed,
+                    load_in_8bit=load_in_8bit,
+                    persist=(idx == 0),  # only primary seed writes the canonical artifacts
+                )
+                per_seed.append(res)
+            except Exception as exc:
+                logger.error(
+                    "Analysis failed for %s seed=%d: %s", model_name, seed, exc,
+                    exc_info=True,
+                )
+
+        if not per_seed:
+            continue
+        all_results[model_name] = per_seed[0]
+
+        if len(per_seed) > 1:
+            agg = _aggregate_seed_summaries(per_seed)
+            agg_path = results_dir / "layer_a" / model_name / "seed_aggregate.json"
+            with open(agg_path, "w") as f:
+                json.dump(agg, f, indent=2)
+            logger.info(
+                "[%s] %d retrieval heads: mean=%.1f ± %.1f over %d seeds.",
+                model_name,
+                agg["n_retrieval_heads"]["mean"],
+                agg["n_retrieval_heads"]["std"] or 0.0,
+                len(per_seed),
             )
-            all_results[model_name] = res
-        except Exception as exc:
-            logger.error("Analysis failed for %s: %s", model_name, exc, exc_info=True)
 
     if all_results:
+        # FDR across models on the (cluster-aware) utility test (item B2).
+        names = list(all_results.keys())
+        pvals = [all_results[m]["statistical_tests"]["clustered_permutation_p"] for m in names]
+        fdr = benjamini_hochberg(pvals)
+        fdr_summary = {
+            "models": names,
+            "raw_p_clustered_permutation": pvals,
+            "p_adjusted_bh": fdr["p_adjusted"],
+            "rejected_at_0.05": fdr["rejected"],
+            "n_significant": fdr["n_significant"],
+        }
+        fdr_path = results_dir / "layer_a" / "fdr_summary.json"
+        fdr_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(fdr_path, "w") as f:
+            json.dump(fdr_summary, f, indent=2)
+        logger.info("Cross-model FDR summary saved to %s", fdr_path)
+
         generate_figures(all_results, results_dir, dpi=fig_dpi, fmt=fig_fmt)
         print_summary_table(all_results)
     else:

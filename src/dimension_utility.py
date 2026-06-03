@@ -14,6 +14,12 @@ from typing import Any
 import numpy as np
 from scipy import stats
 
+from src.stats_utils import (
+    bootstrap_mean_diff_ci,
+    clustered_permutation_test,
+    cohens_d,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -201,8 +207,15 @@ class DimensionUtilityAnalyzer:
 
         Returns:
             Dict with keys: retrieval_mean, retrieval_std, non_retrieval_mean,
-            non_retrieval_std, t_statistic, p_value, per_head_scalar,
-            n_retrieval, n_non_retrieval.
+            non_retrieval_std (all sample SD, ddof=1), t_statistic, p_value,
+            cohens_d, ci_* (bootstrap CI on the mean difference),
+            clustered_permutation_p (layer-clustered, addresses
+            pseudoreplication), per_head_scalar, n_retrieval, n_non_retrieval.
+
+        Note: the Welch t-test treats every head as an independent observation,
+        which overstates significance because heads within a layer are
+        correlated. ``clustered_permutation_p`` is the statistic to report;
+        the t-test p-value is kept for comparison only. See docs/LIMITATIONS.md.
         """
         per_head_scalar = norms.mean(axis=-1)  # (n_layers, n_heads)
         retrieval_set = set(retrieval_heads)
@@ -210,37 +223,63 @@ class DimensionUtilityAnalyzer:
 
         retrieval_vals: list[float] = []
         non_retrieval_vals: list[float] = []
+        # Flat arrays + layer index, for the cluster-aware permutation test.
+        all_vals: list[float] = []
+        all_labels: list[int] = []
+        all_layers: list[int] = []
 
         for layer in range(n_layers):
             for head in range(n_heads):
                 val = float(per_head_scalar[layer, head])
-                if (layer, head) in retrieval_set:
-                    retrieval_vals.append(val)
-                else:
-                    non_retrieval_vals.append(val)
+                is_ret = (layer, head) in retrieval_set
+                (retrieval_vals if is_ret else non_retrieval_vals).append(val)
+                all_vals.append(val)
+                all_labels.append(int(is_ret))
+                all_layers.append(layer)
 
         if len(retrieval_vals) < 2 or len(non_retrieval_vals) < 2:
             logger.warning(
-                "Insufficient samples for t-test: %d retrieval, %d non-retrieval.",
+                "Insufficient samples for inference: %d retrieval, %d non-retrieval.",
                 len(retrieval_vals),
                 len(non_retrieval_vals),
             )
             t_stat, p_val = float("nan"), float("nan")
+            d_val = float("nan")
+            ci = {"mean_diff": float("nan"), "ci_low": float("nan"),
+                  "ci_high": float("nan"), "ci_level": 0.95}
+            perm = {"observed_diff": float("nan"), "p_value": float("nan"), "n_perm": 0}
         else:
             t_stat, p_val = stats.ttest_ind(
                 retrieval_vals, non_retrieval_vals, equal_var=False
             )
+            d_val = cohens_d(retrieval_vals, non_retrieval_vals)
+            ci = bootstrap_mean_diff_ci(retrieval_vals, non_retrieval_vals)
+            perm = clustered_permutation_test(
+                np.asarray(all_vals),
+                np.asarray(all_labels),
+                np.asarray(all_layers),
+            )
 
-        ret_arr = np.array(retrieval_vals, dtype=np.float32)
-        non_ret_arr = np.array(non_retrieval_vals, dtype=np.float32)
+        ret_arr = np.array(retrieval_vals, dtype=np.float64)
+        non_ret_arr = np.array(non_retrieval_vals, dtype=np.float64)
+
+        def _std(arr: np.ndarray) -> float:
+            # Sample SD (ddof=1) — item B6.
+            return float(arr.std(ddof=1)) if len(arr) > 1 else float("nan")
 
         return {
             "retrieval_mean": float(ret_arr.mean()) if len(ret_arr) else float("nan"),
-            "retrieval_std": float(ret_arr.std()) if len(ret_arr) else float("nan"),
+            "retrieval_std": _std(ret_arr),
             "non_retrieval_mean": float(non_ret_arr.mean()) if len(non_ret_arr) else float("nan"),
-            "non_retrieval_std": float(non_ret_arr.std()) if len(non_ret_arr) else float("nan"),
+            "non_retrieval_std": _std(non_ret_arr),
             "t_statistic": float(t_stat),
             "p_value": float(p_val),
+            "cohens_d": float(d_val),
+            "mean_diff": ci["mean_diff"],
+            "ci_low": ci["ci_low"],
+            "ci_high": ci["ci_high"],
+            "ci_level": ci["ci_level"],
+            "clustered_permutation_p": perm["p_value"],
             "per_head_scalar": per_head_scalar.tolist(),
             "n_retrieval": len(retrieval_vals),
             "n_non_retrieval": len(non_retrieval_vals),
@@ -254,6 +293,11 @@ class DimensionUtilityAnalyzer:
         """
         Compute Pearson and Spearman correlation between retrieval score and
         mean dimension utility across all heads.
+
+        Note (item B5): retrieval hit-rate scores are heavily zero-inflated
+        (most heads score exactly 0), which violates the bivariate-normality
+        assumption behind Pearson's r. Report Spearman's rho as the primary
+        statistic; Pearson is retained only for comparison.
 
         Args:
             retrieval_scores: (n_layers, n_heads) hit-rate matrix.

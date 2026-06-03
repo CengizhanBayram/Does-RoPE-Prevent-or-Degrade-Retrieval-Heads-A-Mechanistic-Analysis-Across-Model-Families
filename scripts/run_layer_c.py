@@ -28,6 +28,8 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.dimension_utility import DimensionUtilityAnalyzer
+from src.model_loader import load_model as _load_model_shared
+from src.repro import capture_environment, set_determinism
 from src.retrieval_head_detector import RetrievalHeadDetector
 from src.visualization import (
     plot_dimension_utility_profile,
@@ -65,31 +67,9 @@ def _hardware_info() -> dict:
     return info
 
 
-def _load_model(model_name: str, model_cfg: dict):
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
-    hf_id = model_cfg["hf_id"]
-    load_8bit = model_cfg.get("load_in_8bit", True)
-    try:
-        import bitsandbytes  # noqa: F401
-        has_bnb = True
-    except ImportError:
-        has_bnb = False
-
-    tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    kwargs: dict = {"device_map": "auto", "trust_remote_code": True}
-    if load_8bit and has_bnb:
-        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-    else:
-        kwargs["torch_dtype"] = torch.float16
-
-    logger.info("Loading %s …", model_name)
-    model = AutoModelForCausalLM.from_pretrained(hf_id, **kwargs)
-    model.eval()
-    return model, tokenizer
+def _load_model(model_name: str, model_cfg: dict, load_in_8bit: bool | None = None):
+    """Load a model at its pinned revision (delegates to src.model_loader)."""
+    return _load_model_shared(model_cfg, model_name, load_in_8bit=load_in_8bit)
 
 
 def _unload(model) -> None:
@@ -118,7 +98,8 @@ def analyse_model(
     seed: int = 42,
 ) -> dict:
     """Run the Layer-A pipeline for one model and return the result dict."""
-    _set_seeds(seed)
+    strict = config.get("reproducibility", {}).get("strict_determinism", False)
+    set_determinism(seed, strict=strict)
     niah_cfg = config["niah"]
     n_samples = niah_cfg["n_samples"]
 
@@ -160,6 +141,11 @@ def analyse_model(
         "non_retrieval_mean_utility": utility_stats["non_retrieval_mean"],
         "t_statistic": utility_stats["t_statistic"],
         "p_value": utility_stats["p_value"],
+        "cohens_d": utility_stats["cohens_d"],
+        "mean_diff": utility_stats["mean_diff"],
+        "ci_low": utility_stats["ci_low"],
+        "ci_high": utility_stats["ci_high"],
+        "clustered_permutation_p": utility_stats["clustered_permutation_p"],
         "pearson_r": correlation["pearson_r"],
         "pearson_p": correlation["pearson_p"],
         "spearman_rho": correlation["spearman_rho"],
@@ -171,7 +157,7 @@ def analyse_model(
         "theta": model_cfg.get("theta"),
         "timestamp": datetime.utcnow().isoformat(),
         "seed": seed,
-        "hardware": _hardware_info(),
+        "environment": capture_environment(),
         "retrieval_heads": retrieval_heads,
         "retrieval_scores": scores.tolist(),
         "dimension_utility": {

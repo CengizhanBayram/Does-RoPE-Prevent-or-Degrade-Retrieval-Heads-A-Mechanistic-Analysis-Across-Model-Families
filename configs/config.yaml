@@ -1,38 +1,64 @@
+# ---------------------------------------------------------------------------
+# Experiment configuration.
+#
+# Reproducibility (item C1): each model has a `revision` field. HuggingFace
+# weights can be updated in place, so for the reportable run REPLACE "main"
+# with the exact commit SHA from the model's "Files and versions" page
+# (e.g. revision: "0e9e39f249a16976918f6564b8830bc894c89659"). The loader
+# logs a warning whenever revision is "main"/null.
+#
+# Quantization (item A2): `load_in_8bit` affects attention distributions and
+# therefore retrieval-head detection. Run at least one model with
+# load_in_8bit:false (fp16) as an ablation, and report the comparison.
+# ---------------------------------------------------------------------------
 models:
   llama3:
     hf_id: "meta-llama/Meta-Llama-3.1-8B"
+    revision: "main"        # TODO(C1): pin to a commit SHA before the final run
     theta: 500000
     n_layers: 32
     n_heads: 32
     head_dim: 128
     load_in_8bit: true
+    license: "llama3.1"     # gated; usage terms must be cited (item G2)
   llama2:
     hf_id: "meta-llama/Llama-2-7b-hf"
+    revision: "main"        # TODO(C1): pin to a commit SHA before the final run
     theta: 10000
     n_layers: 32
     n_heads: 32
     head_dim: 128
     load_in_8bit: true
+    license: "llama2"       # gated; usage terms must be cited (item G2)
   qwen:
     hf_id: "Qwen/Qwen2.5-7B"
+    revision: "main"        # TODO(C1): pin to a commit SHA before the final run
     theta: 1000000
     n_layers: 28
     n_heads: 28
     head_dim: 128
     load_in_8bit: true
+    license: "apache-2.0"
   olmo:
     hf_id: "allenai/OLMo-2-1124-7B"
+    revision: "main"        # TODO(C1): pin to a commit SHA before the final run
     theta: 500000
     n_layers: 32
     n_heads: 32
     head_dim: 128
     load_in_8bit: true
+    license: "apache-2.0"
 
 niah:
   context_lengths: [1024, 2048, 4096, 8192]
   needle_positions: [0.1, 0.25, 0.5, 0.75, 0.9]
   n_samples: 100
+  # score_threshold: a head counts as "retrieval" if its NIAH hit rate >= this.
+  # Value is somewhat arbitrary; run scripts/run_threshold_sweep.py to confirm
+  # conclusions are robust to it (item A7).
   score_threshold: 0.1
+  # seeds: list used for multi-seed runs to estimate variance (item B3).
+  seeds: [42, 123, 2024]
 
 dimension_utility:
   n_rope_freq_bins: 8
@@ -43,6 +69,9 @@ activation_patching:
   n_samples: 50
 
 olmo_checkpoints:
+  # step_stride controls checkpoint granularity for Layer B (training dynamics).
+  # 10000 → ~50 checkpoints (~25 h); 20000 → ~25 checkpoints (~12 h). Justify the
+  # chosen granularity in the paper (item E3).
   step_stride: 10000
   resume: true
   cache_dir: "./cache/olmo_checkpoints"
@@ -51,3 +80,8 @@ output:
   results_dir: "./results"
   figures_dpi: 300
   figure_format: "pdf"
+
+reproducibility:
+  # strict=true forces deterministic CUDA kernels (slower) for the final run
+  # (item C4). Leave false for exploratory throughput.
+  strict_determinism: false

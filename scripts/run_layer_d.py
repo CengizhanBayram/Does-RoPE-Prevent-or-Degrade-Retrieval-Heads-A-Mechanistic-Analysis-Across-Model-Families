@@ -29,6 +29,8 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.activation_patching import ActivationPatcher
+from src.model_loader import load_model as _load_model_shared
+from src.repro import capture_environment, set_determinism
 from src.retrieval_head_detector import RetrievalHeadDetector
 from src.visualization import plot_activation_patching_results
 
@@ -86,31 +88,9 @@ def _pick_best_model(config: dict, results_dir: Path) -> str:
     return best_model or list(config["models"].keys())[0]
 
 
-def _load_model(model_name: str, model_cfg: dict):
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
-    hf_id = model_cfg["hf_id"]
-    load_8bit = model_cfg.get("load_in_8bit", True)
-    try:
-        import bitsandbytes  # noqa: F401
-        has_bnb = True
-    except ImportError:
-        has_bnb = False
-
-    tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    kwargs: dict = {"device_map": "auto", "trust_remote_code": True}
-    if load_8bit and has_bnb:
-        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-    else:
-        kwargs["torch_dtype"] = torch.float16
-
-    logger.info("Loading model %s …", model_name)
-    model = AutoModelForCausalLM.from_pretrained(hf_id, **kwargs)
-    model.eval()
-    return model, tokenizer
+def _load_model(model_name: str, model_cfg: dict, load_in_8bit: bool | None = None):
+    """Load a model at its pinned revision (delegates to src.model_loader)."""
+    return _load_model_shared(model_cfg, model_name, load_in_8bit=load_in_8bit)
 
 
 def _results_to_serializable(results: dict) -> dict:
@@ -186,7 +166,8 @@ def main() -> None:
 
     logger.info("Found %d retrieval heads to patch.", len(retrieval_heads))
 
-    _set_seeds(args.seed)
+    strict = config.get("reproducibility", {}).get("strict_determinism", False)
+    set_determinism(args.seed, strict=strict)
     model, tokenizer = _load_model(model_name, config["models"][model_name])
 
     # Generate fresh NIAH samples for patching evaluation
@@ -215,17 +196,33 @@ def main() -> None:
     out_dir = results_dir / "layer_d" / model_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    mean_ce = float(causal_df["causal_effect"].mean())
+    # Bootstrap CI on the mean causal effect across heads (item B4).
+    ce_vals = causal_df["causal_effect"].to_numpy()
+    if len(ce_vals) > 1:
+        rng = np.random.default_rng(args.seed)
+        boot = np.array([
+            rng.choice(ce_vals, size=len(ce_vals), replace=True).mean()
+            for _ in range(10000)
+        ])
+        ce_ci = [float(np.quantile(boot, 0.025)), float(np.quantile(boot, 0.975))]
+    else:
+        ce_ci = [float("nan"), float("nan")]
+
     result = {
         "model": model_name,
         "timestamp": datetime.utcnow().isoformat(),
         "seed": args.seed,
         "k_dims": k_dims,
         "n_samples": args.n_samples,
+        "environment": capture_environment(),
         "patching_results": _results_to_serializable(patching_results),
         "causal_effects": causal_df.to_dict(orient="records"),
         "summary": {
-            "mean_causal_effect": float(causal_df["causal_effect"].mean()),
-            "hypothesis": "H2" if causal_df["causal_effect"].mean() < 0 else "unexpected",
+            "mean_causal_effect": mean_ce,
+            "mean_causal_effect_ci95": ce_ci,
+            "n_heads_tested": int(len(ce_vals)),
+            "hypothesis": "H2" if mean_ce < 0 else "unexpected",
         },
     }
 

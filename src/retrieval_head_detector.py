@@ -1,6 +1,15 @@
 """
 Retrieval head detection via NIAH (Needle-in-a-Haystack) scoring.
-Implements Wu et al. (ICLR 2025) methodology.
+
+METHOD NOTE (item A1 — read before citing):
+This is a *simplified proxy* adapted from Wu et al. (ICLR 2025), not a
+re-implementation of their full retrieval score. Wu et al. accumulate a
+copy-paste score over the tokens the model generates while answering. Here we
+take a single forward pass and check whether each head's attention argmax at
+the final input position falls inside the needle span. This is cheaper and
+sufficient for *relative* comparisons across heads/models, but it is a
+different (coarser) operationalisation. Describe it accurately in the paper as
+"an adapted, single-pass attention-argmax variant of Wu et al. (2025)".
 """
 
 from __future__ import annotations
@@ -16,69 +25,20 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-logger = logging.getLogger(__name__)
+from src.corpus import build_haystack, load_haystack_corpus
 
-_FALLBACK_SENTENCES: list[str] = [
-    "The quick brown fox jumps over the lazy dog.",
-    "In the beginning God created the heavens and the earth.",
-    "It was the best of times, it was the worst of times.",
-    "Call me Ishmael.",
-    "All happy families are alike; each unhappy family is unhappy in its own way.",
-    "It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want of a wife.",
-    "The sky above the port was the color of television, tuned to a dead channel.",
-    "It was a bright cold day in April, and the clocks were striking thirteen.",
-    "Lolita, light of my life, fire of my loins.",
-    "It was the epoch of belief, it was the epoch of incredulity.",
-    "We were somewhere around Barstow on the edge of the desert when the drugs began to take hold.",
-    "Many years later, as he faced the firing squad, Colonel Aureliano Buendía was to remember that distant afternoon.",
-    "The man in black fled across the desert, and the gunman followed.",
-    "It was a dark and stormy night; the rain fell in torrents.",
-    "You don't know about me without you have read a book by the name of The Adventures of Tom Sawyer.",
-    "Whether I shall turn out to be the hero of my own life, or whether that station will be held by anybody else, these pages must show.",
-    "Last night I dreamt I went to Manderley again.",
-    "It was the day my grandmother exploded.",
-    "The sun shone, having no alternative, on the nothing new.",
-    "Far out in the uncharted backwaters of the unfashionable end of the western spiral arm of the Galaxy.",
-    "Once upon a time and a very good time it was there was a moocow coming down along the road.",
-    "As Gregor Samsa awoke one morning from uneasy dreams he found himself transformed in his bed into a gigantic insect.",
-    "Someone must have slandered Josef K., for one morning, without having done anything wrong, he was arrested.",
-    "It was a pleasure to burn.",
-    "In my younger and more vulnerable years my father gave me some advice.",
-    "They shoot the white girl first.",
-    "If you really want to hear about it, the first thing you'll probably want to know is where I was born.",
-    "There was a boy called Eustace Clarence Scrubb, and he almost deserved it.",
-    "The drought had lasted now for ten million years, and the reign of the terrible lizards had long since ended.",
-    "All children, except one, grow up.",
-    "One morning, when Gregor Samsa woke from troubled dreams, he found himself transformed in his bed into a horrible vermin.",
-    "In the late summer of that year we lived in a house in a village that looked across the river and the plain to the mountains.",
-    "Robert Cohn was once middleweight boxing champion of Princeton.",
-    "The studio was filled with the rich odour of roses.",
-    "124 was spiteful. Full of a baby's venom.",
-    "It was love at first sight.",
-    "I am an invisible man.",
-    "The most merciful thing in the world, I think, is the inability of the human mind to correlate all its contents.",
-    "Somewhere in la Mancha, in a place whose name I do not care to remember.",
-    "A screaming comes across the sky.",
-    "It was a wrong number that started it, the telephone ringing three times in the dead of night.",
-    "Of man's first disobedience, and the fruit of that forbidden tree whose mortal taste brought death into the world.",
-    "The world is what it is; men who are nothing, who allow themselves to become nothing, have no place in it.",
-    "Time is not a line but a dimension, like the dimensions of space.",
-    "Science has now proven that raindrops keep falling on my head.",
-    "The empire at its height stretched from the Atlantic coast to central Asia.",
-    "Radio telescopes detected a repeating fast-radio burst from a distant galaxy.",
-    "Quantum computers can solve certain optimization problems exponentially faster.",
-    "The human genome contains approximately three billion base pairs.",
-    "Neural networks learn by adjusting the weights of millions of parameters.",
-]
+logger = logging.getLogger(__name__)
 
 
 class RetrievalHeadDetector:
     """
     Detects retrieval heads in transformer models using NIAH scoring.
 
-    Following Wu et al. (ICLR 2025): a head is considered a retrieval head
-    if, during a Needle-in-a-Haystack task, its attention argmax at the final
-    token position lands on needle tokens.
+    Adapted (simplified) from Wu et al. (ICLR 2025): a head is flagged as a
+    retrieval head if, on a Needle-in-a-Haystack task, its attention argmax at
+    the final input position lands inside the needle span, aggregated as a hit
+    rate over samples. See the module docstring for how this differs from the
+    original copy-paste retrieval score.
     """
 
     def __init__(
@@ -105,6 +65,9 @@ class RetrievalHeadDetector:
 
         self.model.eval()
         self._haystack_corpus: list[str] | None = None
+        # Local RNG so sample generation is independent of unrelated global
+        # random() calls elsewhere in the pipeline (item C5).
+        self._rng = random.Random(seed)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -153,34 +116,9 @@ class RetrievalHeadDetector:
     # ------------------------------------------------------------------
 
     def _load_haystack_corpus(self) -> list[str]:
-        """Load PG-19 sentences; fall back to hardcoded sentences."""
-        if self._haystack_corpus is not None:
-            return self._haystack_corpus
-
-        try:
-            from datasets import load_dataset  # type: ignore
-
-            logger.info("Loading PG-19 haystack corpus …")
-            ds = load_dataset("pg19", split="train", streaming=True)
-            sentences: list[str] = []
-            for example in ds:
-                text: str = example["text"]
-                for sent in text.split(". "):
-                    sent = sent.strip()
-                    if 20 < len(sent) < 200:
-                        sentences.append(sent + ".")
-                    if len(sentences) >= 5000:
-                        break
-                if len(sentences) >= 5000:
-                    break
-            if sentences:
-                logger.info("Loaded %d sentences from PG-19.", len(sentences))
-                self._haystack_corpus = sentences
-                return sentences
-        except Exception as exc:
-            logger.warning("Could not load PG-19: %s — using fallback corpus.", exc)
-
-        self._haystack_corpus = _FALLBACK_SENTENCES * 20
+        """Load the shared haystack corpus (PG-19 with fallback) — item C3."""
+        if self._haystack_corpus is None:
+            self._haystack_corpus = load_haystack_corpus(max_sentences=5000)
         return self._haystack_corpus
 
     # ------------------------------------------------------------------
@@ -189,23 +127,11 @@ class RetrievalHeadDetector:
 
     def _generate_code(self) -> str:
         """Generate a random 5-character alphanumeric passphrase code."""
-        return "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
+        return "".join(self._rng.choices(string.ascii_uppercase + string.digits, k=5))
 
     def _build_haystack(self, context_length: int, sentences: list[str]) -> str:
-        """Build a haystack string of approximately context_length tokens."""
-        rng_sentences = sentences.copy()
-        random.shuffle(rng_sentences)
-
-        parts: list[str] = []
-        total_chars = 0
-        char_budget = context_length * 4  # rough estimate: 1 token ≈ 4 chars
-
-        for sent in rng_sentences:
-            parts.append(sent)
-            total_chars += len(sent) + 1
-            if total_chars >= char_budget:
-                break
-        return " ".join(parts)
+        """Build a haystack of ~context_length tokens (shared impl, local RNG)."""
+        return build_haystack(context_length, sentences, self._rng)
 
     def _insert_needle(
         self, haystack: str, needle: str, position: float
@@ -260,11 +186,11 @@ class RetrievalHeadDetector:
         Returns:
             List of sample dicts with keys: prompt, prompt_ids, code,
             needle_token_ids, needle_start_idx, needle_end_idx,
-            context_length, needle_position.
+            context_length, needle_position, actual_token_length.
         """
-        random.seed(self.seed)
-        torch.manual_seed(self.seed)
-        np.random.seed(self.seed)
+        # Reseed the local RNG so repeated calls are reproducible without
+        # touching global RNG state (item C5).
+        self._rng.seed(self.seed)
 
         sentences = self._load_haystack_corpus()
         samples: list[dict] = []
@@ -339,7 +265,8 @@ class RetrievalHeadDetector:
                         "needle_token_ids": needle_ids,
                         "needle_start_idx": start_idx,
                         "needle_end_idx": end_idx,
-                        "context_length": context_length,
+                        "context_length": context_length,        # nominal target
+                        "actual_token_length": len(prompt_ids),  # measured (item A5)
                         "needle_position": needle_position,
                     }
                 )
@@ -353,7 +280,16 @@ class RetrievalHeadDetector:
                 len(samples),
                 n_samples,
             )
-        logger.info("Generated %d NIAH samples.", len(samples))
+        if samples:
+            lengths = np.array([s["actual_token_length"] for s in samples])
+            logger.info(
+                "Generated %d NIAH samples. Actual token length: "
+                "mean=%.0f min=%d max=%d (nominal targets=%s).",
+                len(samples), lengths.mean(), lengths.min(), lengths.max(),
+                context_lengths,
+            )
+        else:
+            logger.info("Generated 0 NIAH samples.")
         return samples
 
     # ------------------------------------------------------------------

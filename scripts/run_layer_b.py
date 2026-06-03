@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.dimension_utility import DimensionUtilityAnalyzer
 from src.olmo_checkpoint_loader import OLMoCheckpointLoader
+from src.repro import capture_environment, set_determinism
 from src.retrieval_head_detector import RetrievalHeadDetector
 from src.visualization import plot_olmo_training_dynamics
 
@@ -86,7 +87,8 @@ def process_checkpoint(
     out_dir.mkdir(parents=True, exist_ok=True)
     result_path = out_dir / "results.json"
 
-    _set_seeds(seed)
+    strict = config.get("reproducibility", {}).get("strict_determinism", False)
+    set_determinism(seed, strict=strict)
     niah_cfg = config["niah"]
 
     try:
@@ -127,7 +129,7 @@ def process_checkpoint(
             "revision": revision,
             "timestamp": datetime.utcnow().isoformat(),
             "seed": seed,
-            "hardware": _hardware_info(),
+            "environment": capture_environment(),
             "retrieval_heads": retrieval_heads,
             "retrieval_scores": scores.tolist(),
             "dimension_utility": {

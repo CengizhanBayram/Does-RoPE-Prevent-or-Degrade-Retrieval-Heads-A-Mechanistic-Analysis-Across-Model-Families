@@ -110,7 +110,11 @@ class ActivationPatcher:
                 return cfg.hidden_size // cfg.num_attention_heads
             except AttributeError:
                 pass
-        return 128  # safe fallback for 7B models
+        logger.warning(
+            "Could not derive head_dim from model config; falling back to 128. "
+            "Patched dimension indices may be wrong for this model (item D4)."
+        )
+        return 128  # fallback for 7B models
 
     # ------------------------------------------------------------------
     # NIAH accuracy under a patch condition
@@ -329,8 +333,23 @@ class ActivationPatcher:
             high = data["high_utility"]
 
             causal_effect = rand - low
-            relative_drop_low = (baseline - low) / (baseline + 1e-8)
-            relative_drop_high = (baseline - high) / (baseline + 1e-8)
+            # FIX D3: a relative drop is undefined when the model never solves
+            # the task unpatched (baseline == 0). Report NaN instead of a
+            # meaningless ratio dominated by the 1e-8 epsilon.
+            if baseline <= 0:
+                relative_drop_low = float("nan")
+                relative_drop_high = float("nan")
+                if not getattr(self, "_warned_zero_baseline", False):
+                    logger.warning(
+                        "Baseline accuracy is 0 for layer=%d head=%d; relative "
+                        "drops set to NaN. Causal effects may be uninterpretable "
+                        "— check that the model solves NIAH unpatched.",
+                        layer, head,
+                    )
+                    self._warned_zero_baseline = True
+            else:
+                relative_drop_low = (baseline - low) / baseline
+                relative_drop_high = (baseline - high) / baseline
 
             rows.append(
                 {
