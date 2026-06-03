@@ -11,9 +11,51 @@ the run scripts. Adds:
 from __future__ import annotations
 
 import logging
+import os
+import shutil
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _hf_hub_cache_dir() -> Path:
+    """Locate the HuggingFace hub cache directory across versions/platforms."""
+    try:
+        from huggingface_hub.constants import HF_HUB_CACHE  # type: ignore
+        return Path(HF_HUB_CACHE)
+    except Exception:
+        env = os.environ.get("HUGGINGFACE_HUB_CACHE") or os.environ.get("HF_HOME")
+        if env:
+            p = Path(env)
+            return p / "hub" if p.name != "hub" else p
+        return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def purge_hf_cache(hf_id: str) -> float:
+    """
+    Delete a model's downloaded weights from the HF hub cache to free disk.
+
+    On Colab the local disk fills after a few 7B downloads, crashing later cells
+    with ``OSError: [Errno 28] No space left on device``. Call this after a model
+    is done (it will be re-downloaded automatically if needed again).
+
+    Args:
+        hf_id: Repo id, e.g. "meta-llama/Meta-Llama-3.1-8B".
+
+    Returns:
+        Approximate GB freed (0.0 if nothing was cached).
+    """
+    repo_folder = "models--" + hf_id.replace("/", "--")
+    path = _hf_hub_cache_dir() / repo_folder
+    if not path.exists():
+        logger.debug("No HF cache to purge at %s", path)
+        return 0.0
+    freed = sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    shutil.rmtree(path, ignore_errors=True)
+    gb = freed / 1e9
+    logger.info("Purged HF cache for %s (~%.1f GB freed).", hf_id, gb)
+    return gb
 
 
 def load_model(
