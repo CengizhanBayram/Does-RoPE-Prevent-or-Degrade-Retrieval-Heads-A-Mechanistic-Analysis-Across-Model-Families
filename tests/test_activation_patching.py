@@ -42,3 +42,28 @@ def test_zero_baseline_gives_nan_relative_drop():
     assert math.isnan(df.iloc[0]["relative_drop_high"])
     # causal_effect itself is still defined (0 here)
     assert df.iloc[0]["causal_effect"] == 0.0
+
+
+def test_frequency_effect_present_and_signed():
+    # §6: zeroing high-freq dims hurts more (high_freq acc lower) ⇒ freq_effect > 0.
+    patcher = _make_patcher()
+    results = {
+        (7, 2): {"layer": 7, "head": 2, "baseline": 0.9,
+                 "low_utility": 0.85, "random": 0.8, "high_utility": 0.3,
+                 "low_freq": 0.88, "high_freq": 0.40},
+    }
+    df = patcher.compute_causal_effect(results)
+    assert "frequency_effect" in df.columns
+    # frequency_effect = low_freq - high_freq = 0.88 - 0.40
+    assert math.isclose(df.iloc[0]["frequency_effect"], 0.48, rel_tol=1e-9)
+
+
+def test_frequency_columns_absent_when_not_run():
+    # Backward-compatible: no freq keys ⇒ no frequency_effect column.
+    patcher = _make_patcher()
+    results = {
+        (0, 0): {"layer": 0, "head": 0, "baseline": 0.8,
+                 "low_utility": 0.7, "random": 0.6, "high_utility": 0.5},
+    }
+    df = patcher.compute_causal_effect(results)
+    assert "frequency_effect" not in df.columns

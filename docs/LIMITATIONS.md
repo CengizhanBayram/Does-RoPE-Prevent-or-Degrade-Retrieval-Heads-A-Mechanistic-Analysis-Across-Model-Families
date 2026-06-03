@@ -4,6 +4,28 @@ This document collects the caveats that must appear in the paper's *Limitations*
 section (or be addressed before submission). Each item maps to the
 publication-readiness checklist.
 
+## Core contribution (paper §6) — frequency vs. utility causal test
+
+Layer D patches each retrieval head along **two independent axes** and measures
+the drop in NIAH accuracy:
+
+- **Utility axis:** zero the k lowest- vs highest-L1-norm dimensions
+  (`low_utility` / `high_utility`), with a `random` control.
+  `causal_effect = random − low_utility`.
+- **Frequency axis (the novel test):** zero the k lowest- vs highest-RoPE-
+  *frequency* dimensions (`low_freq` / `high_freq`).
+  `frequency_effect = low_freq − high_freq`.
+
+Because low-frequency and high-utility dimensions are correlated but not
+identical, the frequency axis isolates the question *"is retrieval degraded by
+RoPE frequency specifically, or merely by general dimension utility?"* — a
+distinction prior work does not make. The bootstrap CI on `frequency_effect`
+(`mean_frequency_effect_ci95` in the Layer-D results JSON) determines whether
+the effect excludes zero. **The finding is publishable in either direction**:
+if the CI excludes zero, retrieval is frequency-specific; if it includes zero,
+RoPE frequency is *not* the causal driver beyond general utility. Report it
+plainly either way.
+
 ## Methodological
 
 - **A1 — Retrieval-head metric is an adapted proxy.** We do *not* re-implement
