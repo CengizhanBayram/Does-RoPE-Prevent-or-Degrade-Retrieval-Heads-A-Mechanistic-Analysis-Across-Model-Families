@@ -215,15 +215,26 @@ class ActivationPatcher:
         k_dims: int | None = None,
         n_samples: int = 50,
         random_seeds: list[int] | None = None,
+        freq_order: "np.ndarray | None" = None,
     ) -> dict:
         """
-        Run three-condition activation patching for each retrieval head.
+        Run multi-condition activation patching for each retrieval head.
 
-        Conditions per head:
+        Utility-axis conditions (always run):
           - baseline: no patch  (computed once, shared across all heads)
           - low_utility: zero k_dims dimensions with lowest L1 norm
           - random: zero k_dims randomly chosen dimensions (avg over 5 seeds)
           - high_utility: zero k_dims dimensions with highest L1 norm
+
+        Frequency-axis conditions (run only when ``freq_order`` is given):
+          - low_freq: zero the k_dims LOWEST-frequency RoPE dimensions
+          - high_freq: zero the k_dims HIGHEST-frequency RoPE dimensions
+
+        The frequency conditions are the key causal test (paper §6): they
+        disentangle whether retrieval is degraded by *RoPE frequency
+        specifically* or merely by *general dimension utility*. Because
+        low-frequency and high-utility dimensions are correlated but not
+        identical, comparing high_freq vs low_freq isolates the frequency axis.
 
         Args:
             retrieval_heads: List of (layer, head) tuples.
@@ -233,6 +244,9 @@ class ActivationPatcher:
             k_dims: Number of dimensions to zero. Defaults to self.k_dims.
             n_samples: Number of samples to use per condition.
             random_seeds: Seeds for random condition averaging (default: 5 seeds).
+            freq_order: Per-head dimension indices sorted by ASCENDING RoPE
+                frequency (``DimensionUtilityAnalyzer.freq_order``). When None,
+                the frequency conditions are skipped.
 
         Returns:
             Dict keyed by (layer, head) tuples with per-condition accuracies.
@@ -240,6 +254,18 @@ class ActivationPatcher:
         k = k_dims or self.k_dims
         seeds = random_seeds or list(range(5))
         eval_samples = samples[:n_samples]
+
+        # Frequency-ranked dimension indices (constant across heads for a model).
+        low_freq_dims: list[int] | None = None
+        high_freq_dims: list[int] | None = None
+        if freq_order is not None:
+            fo = np.asarray(freq_order).astype(int)
+            low_freq_dims = fo[:k].tolist()      # lowest-frequency dims
+            high_freq_dims = fo[-k:].tolist()    # highest-frequency dims
+            logger.info(
+                "Frequency conditions enabled: low_freq dims=%s, high_freq dims=%s",
+                low_freq_dims, high_freq_dims,
+            )
 
         norms_matrix: np.ndarray | None = utility_scores.get("_norms")
 
@@ -286,7 +312,7 @@ class ActivationPatcher:
                 random_accs.append(acc)
             random_acc = float(np.mean(random_accs))
 
-            results[(layer_idx, head_idx)] = {
+            entry = {
                 "layer": layer_idx,
                 "head": head_idx,
                 "baseline": baseline_acc,
@@ -297,10 +323,34 @@ class ActivationPatcher:
                 "high_dims": high_dims,
                 "k_dims": k,
             }
-            logger.info(
-                "  baseline=%.3f  low=%.3f  rand=%.3f  high=%.3f",
-                baseline_acc, low_acc, random_acc, high_acc,
-            )
+
+            # Frequency-axis conditions (paper §6 causal test).
+            if low_freq_dims is not None and high_freq_dims is not None:
+                low_freq_acc = self._evaluate_accuracy(
+                    eval_samples, layer_idx, head_idx, low_freq_dims
+                )
+                high_freq_acc = self._evaluate_accuracy(
+                    eval_samples, layer_idx, head_idx, high_freq_dims
+                )
+                entry.update({
+                    "low_freq": low_freq_acc,
+                    "high_freq": high_freq_acc,
+                    "low_freq_dims": low_freq_dims,
+                    "high_freq_dims": high_freq_dims,
+                })
+                logger.info(
+                    "  baseline=%.3f  low=%.3f  rand=%.3f  high=%.3f  "
+                    "low_freq=%.3f  high_freq=%.3f",
+                    baseline_acc, low_acc, random_acc, high_acc,
+                    low_freq_acc, high_freq_acc,
+                )
+            else:
+                logger.info(
+                    "  baseline=%.3f  low=%.3f  rand=%.3f  high=%.3f",
+                    baseline_acc, low_acc, random_acc, high_acc,
+                )
+
+            results[(layer_idx, head_idx)] = entry
 
         return results
 
@@ -318,12 +368,21 @@ class ActivationPatcher:
         Negative → low-utility dims are already unused (H2-consistent).
         Positive → low-utility dims are load-bearing (unexpected).
 
+        Frequency axis (paper §6), present only when the frequency conditions
+        were run:
+            frequency_effect = (baseline - high_freq) - (baseline - low_freq)
+                             = low_freq - high_freq
+        Positive → zeroing HIGH-frequency RoPE dims hurts retrieval more than
+        zeroing low-frequency dims, i.e. retrieval is *frequency-specific*.
+        ~Zero → frequency does not matter beyond general utility.
+
         Args:
             results: Output of run_patching_experiment().
 
         Returns:
             DataFrame with columns: layer, head, baseline, low_utility, random,
-            high_utility, causal_effect, relative_drop_low, relative_drop_high.
+            high_utility, causal_effect, relative_drop_low, relative_drop_high,
+            and (when available) low_freq, high_freq, frequency_effect.
         """
         rows = []
         for (layer, head), data in results.items():
@@ -351,19 +410,29 @@ class ActivationPatcher:
                 relative_drop_low = (baseline - low) / baseline
                 relative_drop_high = (baseline - high) / baseline
 
-            rows.append(
-                {
-                    "layer": layer,
-                    "head": head,
-                    "baseline": baseline,
-                    "low_utility": low,
-                    "random": rand,
-                    "high_utility": high,
-                    "causal_effect": causal_effect,
-                    "relative_drop_low": relative_drop_low,
-                    "relative_drop_high": relative_drop_high,
-                }
-            )
+            row = {
+                "layer": layer,
+                "head": head,
+                "baseline": baseline,
+                "low_utility": low,
+                "random": rand,
+                "high_utility": high,
+                "causal_effect": causal_effect,
+                "relative_drop_low": relative_drop_low,
+                "relative_drop_high": relative_drop_high,
+            }
+
+            # Frequency axis (paper §6) — only when those conditions were run.
+            if "low_freq" in data and "high_freq" in data:
+                low_freq = data["low_freq"]
+                high_freq = data["high_freq"]
+                row["low_freq"] = low_freq
+                row["high_freq"] = high_freq
+                # frequency_effect = low_freq - high_freq; >0 ⇒ zeroing high-freq
+                # dims hurts more ⇒ retrieval is frequency-specific.
+                row["frequency_effect"] = low_freq - high_freq
+
+            rows.append(row)
         return pd.DataFrame(rows)
 
 

@@ -29,6 +29,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.activation_patching import ActivationPatcher
+from src.dimension_utility import DimensionUtilityAnalyzer
 from src.model_loader import load_model as _load_model_shared
 from src.repro import capture_environment, set_determinism
 from src.retrieval_head_detector import RetrievalHeadDetector
@@ -102,21 +103,37 @@ def _results_to_serializable(results: dict) -> dict:
 
 
 def print_causal_effect_table(df) -> None:
-    import pandas as pd
-    print("\n" + "=" * 75)
-    print(f"{'Layer':>6} {'Head':>6} {'Baseline':>10} {'Low-util':>10} {'Random':>10} {'High-util':>10} {'CE':>10}")
-    print("=" * 75)
+    has_freq = "frequency_effect" in df.columns
+    width = 96 if has_freq else 75
+    print("\n" + "=" * width)
+    header = (f"{'Layer':>6} {'Head':>6} {'Baseline':>10} {'Low-util':>10} "
+             f"{'Random':>10} {'High-util':>10} {'CE':>10}")
+    if has_freq:
+        header += f" {'Low-freq':>10} {'High-freq':>10}"
+    print(header)
+    print("=" * width)
     for _, row in df.iterrows():
-        print(
+        line = (
             f"{int(row['layer']):>6} {int(row['head']):>6} "
             f"{row['baseline']:>10.4f} {row['low_utility']:>10.4f} "
             f"{row['random']:>10.4f} {row['high_utility']:>10.4f} "
             f"{row['causal_effect']:>10.4f}"
         )
-    print("=" * 75)
+        if has_freq:
+            line += f" {row['low_freq']:>10.4f} {row['high_freq']:>10.4f}"
+        print(line)
+    print("=" * width)
     mean_ce = df["causal_effect"].mean()
     direction = "H2 (low-util dims causally irrelevant)" if mean_ce < 0 else "unexpected (low-util load-bearing)"
-    print(f"Mean causal effect: {mean_ce:.4f}  →  {direction}\n")
+    print(f"Mean causal effect (utility): {mean_ce:.4f}  →  {direction}")
+    if has_freq:
+        mean_fe = df["frequency_effect"].mean()
+        fdir = ("frequency-specific: high-freq RoPE dims load-bearing"
+                if mean_fe > 0 else
+                "frequency-specific: low-freq dims load-bearing"
+                if mean_fe < 0 else "no frequency specificity")
+        print(f"Mean frequency effect (§6):  {mean_fe:.4f}  →  {fdir}")
+    print()
 
 
 def parse_args() -> argparse.Namespace:
@@ -182,6 +199,10 @@ def main() -> None:
         needle_positions=config["niah"]["needle_positions"],
     )
 
+    # RoPE frequency ordering for the frequency-axis causal test (paper §6).
+    analyzer = DimensionUtilityAnalyzer(model, config)
+    freq_order = analyzer.freq_order
+
     patcher = ActivationPatcher(model, tokenizer, config)
     patching_results = patcher.run_patching_experiment(
         retrieval_heads=retrieval_heads,
@@ -189,6 +210,7 @@ def main() -> None:
         samples=samples,
         k_dims=k_dims,
         n_samples=args.n_samples,
+        freq_order=freq_order,
     )
     causal_df = patcher.compute_causal_effect(patching_results)
 
@@ -196,18 +218,51 @@ def main() -> None:
     out_dir = results_dir / "layer_d" / model_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    mean_ce = float(causal_df["causal_effect"].mean())
-    # Bootstrap CI on the mean causal effect across heads (item B4).
-    ce_vals = causal_df["causal_effect"].to_numpy()
-    if len(ce_vals) > 1:
+    def _mean_ci(values: np.ndarray) -> tuple[float, list[float]]:
+        """Mean + bootstrap 95% CI (item B4)."""
+        values = np.asarray(values, dtype=float)
+        values = values[~np.isnan(values)]
+        if len(values) < 2:
+            return (float(values.mean()) if len(values) else float("nan"),
+                    [float("nan"), float("nan")])
         rng = np.random.default_rng(args.seed)
         boot = np.array([
-            rng.choice(ce_vals, size=len(ce_vals), replace=True).mean()
+            rng.choice(values, size=len(values), replace=True).mean()
             for _ in range(10000)
         ])
-        ce_ci = [float(np.quantile(boot, 0.025)), float(np.quantile(boot, 0.975))]
-    else:
-        ce_ci = [float("nan"), float("nan")]
+        return float(values.mean()), [float(np.quantile(boot, 0.025)),
+                                      float(np.quantile(boot, 0.975))]
+
+    mean_ce, ce_ci = _mean_ci(causal_df["causal_effect"].to_numpy())
+
+    summary = {
+        "mean_causal_effect": mean_ce,
+        "mean_causal_effect_ci95": ce_ci,
+        "n_heads_tested": int(len(causal_df)),
+        "hypothesis": "H2" if mean_ce < 0 else "unexpected",
+    }
+
+    # Frequency-axis result (paper §6) — only present if conditions were run.
+    if "frequency_effect" in causal_df.columns:
+        mean_fe, fe_ci = _mean_ci(causal_df["frequency_effect"].to_numpy())
+        # CI excludes 0 → frequency matters beyond general utility.
+        freq_specific = not (fe_ci[0] <= 0 <= fe_ci[1])
+        summary.update({
+            "mean_frequency_effect": mean_fe,
+            "mean_frequency_effect_ci95": fe_ci,
+            "frequency_specific": bool(freq_specific),
+            "frequency_finding": (
+                "frequency-specific (high-freq RoPE dims are load-bearing)"
+                if (freq_specific and mean_fe > 0) else
+                "frequency-specific (low-freq dims more load-bearing)"
+                if (freq_specific and mean_fe < 0) else
+                "no frequency specificity beyond general utility"
+            ),
+        })
+        logger.info(
+            "Frequency effect: mean=%.4f CI95=%s → %s",
+            mean_fe, fe_ci, summary["frequency_finding"],
+        )
 
     result = {
         "model": model_name,
@@ -218,12 +273,7 @@ def main() -> None:
         "environment": capture_environment(),
         "patching_results": _results_to_serializable(patching_results),
         "causal_effects": causal_df.to_dict(orient="records"),
-        "summary": {
-            "mean_causal_effect": mean_ce,
-            "mean_causal_effect_ci95": ce_ci,
-            "n_heads_tested": int(len(ce_vals)),
-            "hypothesis": "H2" if mean_ce < 0 else "unexpected",
-        },
+        "summary": summary,
     }
 
     result_path = out_dir / "results.json"

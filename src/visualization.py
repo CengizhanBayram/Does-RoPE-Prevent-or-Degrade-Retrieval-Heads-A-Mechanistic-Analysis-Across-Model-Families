@@ -348,6 +348,13 @@ def plot_activation_patching_results(
     condition_labels = ["Baseline", "Low-utility\nzeroed", "Random\nzeroed", "High-utility\nzeroed"]
     colors = ["#4c72b0", "#55a868", "#c44e52", "#dd8452"]
 
+    # Frequency-axis conditions (paper §6) are shown only when present.
+    has_freq = any("low_freq" in d and "high_freq" in d for d in patching_results.values())
+    if has_freq:
+        conditions += ["low_freq", "high_freq"]
+        condition_labels += ["Low-freq\nzeroed", "High-freq\nzeroed"]
+        colors += ["#8172b3", "#937860"]
+
     acc_per_cond: dict[str, list[float]] = {c: [] for c in conditions}
     for data in patching_results.values():
         for c in conditions:
@@ -357,7 +364,7 @@ def plot_activation_patching_results(
     means = [np.mean(acc_per_cond[c]) if acc_per_cond[c] else 0.0 for c in conditions]
     stds = [np.std(acc_per_cond[c]) if acc_per_cond[c] else 0.0 for c in conditions]
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(11, 5) if has_freq else (8, 5))
     x = np.arange(len(conditions))
     bars = ax.bar(
         x, means, yerr=stds, capsize=5,
@@ -377,12 +384,21 @@ def plot_activation_patching_results(
             ha="center", va="bottom", fontsize=9,
         )
 
+    annotations = []
     if acc_per_cond["baseline"] and acc_per_cond["low_utility"] and acc_per_cond["random"]:
         ce = np.mean(acc_per_cond["random"]) - np.mean(acc_per_cond["low_utility"])
         direction = "H2 (low-util unused)" if ce < 0 else "unexpected (low-util load-bearing)"
+        annotations.append(f"Utility effect = {ce:.3f}\n→ {direction}")
+    if has_freq and acc_per_cond["low_freq"] and acc_per_cond["high_freq"]:
+        fe = np.mean(acc_per_cond["low_freq"]) - np.mean(acc_per_cond["high_freq"])
+        fdir = ("frequency-specific\n(high-freq load-bearing)" if fe > 0
+                else "frequency-specific\n(low-freq load-bearing)" if fe < 0
+                else "no frequency specificity")
+        annotations.append(f"Frequency effect = {fe:.3f}\n→ {fdir}")
+    if annotations:
         ax.text(
             0.98, 0.95,
-            f"Causal effect = {ce:.3f}\n→ {direction}",
+            "\n\n".join(annotations),
             transform=ax.transAxes,
             ha="right", va="top", fontsize=8,
             bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray"),
