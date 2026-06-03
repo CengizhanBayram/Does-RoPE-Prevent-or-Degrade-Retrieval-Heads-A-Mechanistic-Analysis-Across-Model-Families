@@ -70,11 +70,16 @@ activation_patching:
 
 olmo_checkpoints:
   # step_stride controls checkpoint granularity for Layer B (training dynamics).
-  # 10000 → ~50 checkpoints (~25 h); 20000 → ~25 checkpoints (~12 h). Justify the
+  # 10000 → ~24 checkpoints (~12 h); 20000 → ~12 checkpoints (~6 h). Justify the
   # chosen granularity in the paper (item E3).
   step_stride: 10000
   resume: true
   cache_dir: "./cache/olmo_checkpoints"
+  # OLMo-2 checkpoint branches are named "stage1-step{N}-tokens{M}B" (main
+  # pretraining) and "stage2-ingredient*-step{N}-..." (annealing). Default to
+  # the clean stage-1 pretraining trajectory. Use
+  #   "^stage(1|2)-.*step\\d+-tokens\\d+B$"  to include both stages.
+  branch_regex: "^stage1-step\\d+-tokens\\d+B$"
 
 output:
   results_dir: "./results"

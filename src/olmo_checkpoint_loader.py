@@ -51,6 +51,15 @@ class OLMoCheckpointLoader:
         self.cache_dir: str = ckpt_cfg.get("cache_dir", "./cache/olmo_checkpoints")
         self.results_dir: str = config.get("output", {}).get("results_dir", "./results")
 
+        # OLMo-2 names its checkpoint branches by training stage, e.g.
+        # "stage1-step237000-tokens995B" (main pretraining trajectory) and
+        # "stage2-ingredient3-step1000-tokens5B" (annealing/mid-training mixes).
+        # For a clean training-dynamics curve we default to the stage-1
+        # pretraining run. Override via config olmo_checkpoints.branch_regex.
+        self.branch_regex: str = ckpt_cfg.get(
+            "branch_regex", r"^stage1-step\d+-tokens\d+B$"
+        )
+
         self._available_steps: list[int] | None = None
 
     # ------------------------------------------------------------------
@@ -62,21 +71,34 @@ class OLMoCheckpointLoader:
         List all checkpoint revisions available for OLMo-2 on HuggingFace.
 
         Returns:
-            List of revision strings matching the "step{N}-tokens{M}B" pattern.
+            List of revision (branch) names matching ``self.branch_regex``,
+            sorted by training step.
         """
         try:
             from huggingface_hub import list_repo_refs  # type: ignore
 
             logger.info("Fetching available revisions for %s …", _OLMO_REPO)
             refs = list_repo_refs(_OLMO_REPO)
-            pattern = re.compile(r"^step\d+-tokens\d+B$")
-            branches = [
-                b.name
-                for b in refs.branches
-                if pattern.match(b.name)
-            ]
+            all_branches = [b.name for b in refs.branches]
+            pattern = re.compile(self.branch_regex)
+            branches = [b for b in all_branches if pattern.match(b)]
+
+            if not branches:
+                # Help diagnose a pattern mismatch (the most common failure).
+                sample = ", ".join(sorted(all_branches)[:5])
+                logger.error(
+                    "No branches matched regex %r among %d branches. "
+                    "Sample branch names: %s. Update "
+                    "olmo_checkpoints.branch_regex in config.yaml to match.",
+                    self.branch_regex, len(all_branches), sample,
+                )
+                return []
+
             branches.sort(key=lambda x: int(re.search(r"step(\d+)", x).group(1)))
-            logger.info("Found %d checkpoint revisions.", len(branches))
+            logger.info(
+                "Found %d checkpoint revisions matching %r (of %d total branches).",
+                len(branches), self.branch_regex, len(all_branches),
+            )
             return branches
         except Exception as exc:
             logger.error("Could not fetch repo refs: %s", exc)
