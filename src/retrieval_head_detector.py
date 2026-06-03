@@ -30,6 +30,164 @@ from src.corpus import build_haystack, load_haystack_corpus
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Paired-seed NIAH sample generation (items C5 / §2.3 paired-seed control)
+#
+# Generation is split into two stages so that the *data* is identical across
+# models:
+#   1. generate_niah_specs(seed)        — tokenizer-INDEPENDENT text specs.
+#      RNG consumption depends only on the seed, never on a tokenizer, so the
+#      same seed yields byte-identical specs for every model.
+#   2. build_samples_from_specs(specs, tokenizer) — per-model tokenization.
+# For cross-model comparison, paired_spec_subset() keeps only the specs that
+# tokenize successfully in EVERY model (intersection), so all models are scored
+# on the exact same n samples.
+# ---------------------------------------------------------------------------
+
+def find_subsequence(seq: list[int], sub: list[int]) -> tuple[int, int] | None:
+    """Return (start, end_exclusive) of the first occurrence of sub in seq."""
+    n, m = len(seq), len(sub)
+    if m == 0:
+        return None
+    for i in range(n - m + 1):
+        if seq[i : i + m] == sub:
+            return i, i + m
+    return None
+
+
+def generate_niah_specs(
+    seed: int,
+    n_samples: int,
+    context_lengths: list[int],
+    needle_positions: list[float],
+    max_corpus_sentences: int = 5000,
+) -> list[dict]:
+    """
+    Generate tokenizer-independent NIAH specifications.
+
+    Deterministic given ``seed``: identical for every model because no tokenizer
+    is involved. Each spec is a dict with: spec_id, prompt, code, needle,
+    context_length, needle_position.
+    """
+    rng = random.Random(seed)
+    sentences = load_haystack_corpus(max_sentences=max_corpus_sentences)
+    combos = [(cl, pos) for cl in context_lengths for pos in needle_positions]
+    per_combo = max(1, n_samples // len(combos))
+
+    specs: list[dict] = []
+    spec_id = 0
+    for context_length, needle_position in combos:
+        for _ in range(per_combo):
+            code = "".join(rng.choices(string.ascii_uppercase + string.digits, k=5))
+            needle = f"The secret passphrase is {code}."
+            query = "What is the secret passphrase?"
+            haystack = build_haystack(context_length, sentences, rng)
+            words = haystack.split()
+            insert_idx = max(0, min(int(len(words) * needle_position), len(words) - 1))
+            words.insert(insert_idx, needle)
+            full_text = " ".join(words)
+            prompt = f"{full_text}\n\n{query}\n\nAnswer:"
+            specs.append({
+                "spec_id": spec_id,
+                "prompt": prompt,
+                "code": code,
+                "needle": needle,
+                "context_length": context_length,
+                "needle_position": needle_position,
+            })
+            spec_id += 1
+    return specs
+
+
+def locate_needle(prompt: str, needle: str, context_length: int, tokenizer) -> dict | None:
+    """
+    Tokenize ``prompt`` and locate the needle token span for a given tokenizer.
+
+    Returns a dict (prompt_ids, needle_token_ids, needle_start_idx,
+    needle_end_idx) or None if the needle cannot be located after tokenization.
+    """
+    encoding = tokenizer(
+        prompt, return_tensors="pt", truncation=True, max_length=context_length + 64
+    )
+    prompt_ids: list[int] = encoding["input_ids"][0].tolist()
+
+    # Try without and with a leading space (tokenizers merge the first token
+    # differently); strip an accidental BOS.
+    for prefix in ("", " "):
+        candidate = tokenizer(prefix + needle, add_special_tokens=False)["input_ids"]
+        bos = tokenizer.bos_token_id
+        if bos is not None and candidate and candidate[0] == bos:
+            candidate = candidate[1:]
+        token_range = find_subsequence(prompt_ids, candidate)
+        if token_range is not None:
+            return {
+                "prompt_ids": prompt_ids,
+                "needle_token_ids": candidate,
+                "needle_start_idx": token_range[0],
+                "needle_end_idx": token_range[1],
+            }
+    return None
+
+
+def build_samples_from_specs(specs: list[dict], tokenizer) -> tuple[list[dict], list[int]]:
+    """
+    Tokenize specs for one model. Returns (samples, valid_spec_ids).
+
+    Specs whose needle cannot be located for this tokenizer are skipped (and
+    excluded from valid_spec_ids).
+    """
+    samples: list[dict] = []
+    valid: list[int] = []
+    for spec in specs:
+        loc = locate_needle(spec["prompt"], spec["needle"], spec["context_length"], tokenizer)
+        if loc is None:
+            continue
+        samples.append({
+            "prompt": spec["prompt"],
+            "prompt_ids": loc["prompt_ids"],
+            "code": spec["code"],
+            "needle_token_ids": loc["needle_token_ids"],
+            "needle_start_idx": loc["needle_start_idx"],
+            "needle_end_idx": loc["needle_end_idx"],
+            "context_length": spec["context_length"],
+            "actual_token_length": len(loc["prompt_ids"]),
+            "needle_position": spec["needle_position"],
+            "spec_id": spec["spec_id"],
+        })
+        valid.append(spec["spec_id"])
+    return samples, valid
+
+
+def valid_spec_ids(specs: list[dict], tokenizer) -> set[int]:
+    """Return the set of spec_ids whose needle tokenizes/locates for a tokenizer."""
+    return set(build_samples_from_specs(specs, tokenizer)[1])
+
+
+def paired_spec_subset(
+    specs: list[dict], tokenizers: dict[str, object]
+) -> tuple[list[dict], list[int]]:
+    """
+    Keep only specs valid in EVERY tokenizer (intersection-drop, §2.3).
+
+    Guarantees all models are scored on the same n samples. Returns
+    (subset_specs, dropped_spec_ids).
+    """
+    keep: set[int] | None = None
+    for tok in tokenizers.values():
+        ids = valid_spec_ids(specs, tok)
+        keep = ids if keep is None else (keep & ids)
+    keep = keep or set()
+    subset = [s for s in specs if s["spec_id"] in keep]
+    dropped = [s["spec_id"] for s in specs if s["spec_id"] not in keep]
+    if dropped:
+        logger.warning(
+            "Paired-seed intersection dropped %d/%d specs (failed tokenization "
+            "in >=1 model): indices %s",
+            len(dropped), len(specs), dropped,
+        )
+    return subset, dropped
+
+
 class RetrievalHeadDetector:
     """
     Detects retrieval heads in transformer models using NIAH scoring.
@@ -175,121 +333,51 @@ class RetrievalHeadDetector:
         needle_positions: list[float],
     ) -> list[dict]:
         """
-        Generate NIAH evaluation samples.
+        Generate NIAH samples for THIS model (single-model convenience path).
+
+        Equivalent to ``generate_niah_specs(seed, ...)`` followed by
+        ``prepare_samples(specs)``. For cross-model PAIRED comparison, generate
+        the specs once and use ``paired_spec_subset`` + ``prepare_samples`` so
+        all models share the identical sample set (§2.3).
+
+        Returns:
+            List of sample dicts (see prepare_samples for keys).
+        """
+        specs = generate_niah_specs(
+            self.seed, n_samples, context_lengths, needle_positions
+        )
+        return self.prepare_samples(specs)
+
+    def prepare_samples(self, specs: list[dict]) -> list[dict]:
+        """
+        Tokenize pre-generated (tokenizer-independent) specs for this model.
 
         Args:
-            n_samples: Total number of samples to generate (distributed evenly
-                over all context_length × needle_position combinations).
-            context_lengths: List of context lengths in tokens.
-            needle_positions: List of fractional needle positions [0, 1].
+            specs: Output of ``generate_niah_specs`` (optionally already passed
+                through ``paired_spec_subset`` for paired comparison).
 
         Returns:
             List of sample dicts with keys: prompt, prompt_ids, code,
-            needle_token_ids, needle_start_idx, needle_end_idx,
-            context_length, needle_position, actual_token_length.
+            needle_token_ids, needle_start_idx, needle_end_idx, context_length,
+            actual_token_length, needle_position, spec_id.
         """
-        # Reseed the local RNG so repeated calls are reproducible without
-        # touching global RNG state (item C5).
-        self._rng.seed(self.seed)
-
-        sentences = self._load_haystack_corpus()
-        samples: list[dict] = []
-        skipped = 0
-
-        combos = [
-            (cl, pos) for cl in context_lengths for pos in needle_positions
-        ]
-        samples_per_combo = max(1, n_samples // len(combos))
-
-        for context_length, needle_position in combos:
-            generated_this_combo = 0
-            attempts = 0
-            # Allow extra attempts to compensate for skipped samples
-            max_attempts = samples_per_combo * 3
-
-            while generated_this_combo < samples_per_combo and attempts < max_attempts:
-                attempts += 1
-                code = self._generate_code()
-                needle = f"The secret passphrase is {code}."
-                query = "What is the secret passphrase?"
-
-                try:
-                    haystack = self._build_haystack(context_length, sentences)
-                    full_text, _ = self._insert_needle(haystack, needle, needle_position)
-                except AssertionError:
-                    skipped += 1
-                    continue
-
-                prompt = f"{full_text}\n\n{query}\n\nAnswer:"
-
-                encoding = self.tokenizer(
-                    prompt,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=context_length + 64,
-                )
-                prompt_ids: list[int] = encoding["input_ids"][0].tolist()
-
-                # Tokenize needle WITHOUT special tokens, then try WITH leading space
-                # to handle tokenizers that merge the first token differently
-                needle_ids: list[int] | None = None
-                for prefix in ("", " "):
-                    candidate = self.tokenizer(
-                        prefix + needle, add_special_tokens=False
-                    )["input_ids"]
-                    # Strip BOS if accidentally included
-                    bos = self.tokenizer.bos_token_id
-                    if bos is not None and candidate and candidate[0] == bos:
-                        candidate = candidate[1:]
-                    token_range = self._find_needle_token_range(prompt_ids, candidate)
-                    if token_range is not None:
-                        needle_ids = candidate
-                        break
-
-                if needle_ids is None or token_range is None:
-                    skipped += 1
-                    logger.debug(
-                        "Needle not found in tokenized prompt "
-                        "(context_length=%d, pos=%.2f). Skipping.",
-                        context_length,
-                        needle_position,
-                    )
-                    continue
-
-                start_idx, end_idx = token_range
-                samples.append(
-                    {
-                        "prompt": prompt,
-                        "prompt_ids": prompt_ids,
-                        "code": code,
-                        "needle_token_ids": needle_ids,
-                        "needle_start_idx": start_idx,
-                        "needle_end_idx": end_idx,
-                        "context_length": context_length,        # nominal target
-                        "actual_token_length": len(prompt_ids),  # measured (item A5)
-                        "needle_position": needle_position,
-                    }
-                )
-                generated_this_combo += 1
-
-        if skipped:
+        samples, valid = build_samples_from_specs(specs, self.tokenizer)
+        dropped = len(specs) - len(valid)
+        if dropped:
             logger.warning(
-                "%d sample attempts skipped (needle not found in tokens). "
-                "Generated %d/%d requested samples.",
-                skipped,
-                len(samples),
-                n_samples,
+                "prepare_samples: %d/%d specs failed tokenization for this model. "
+                "For paired comparison pre-filter with paired_spec_subset.",
+                dropped, len(specs),
             )
         if samples:
             lengths = np.array([s["actual_token_length"] for s in samples])
             logger.info(
-                "Generated %d NIAH samples. Actual token length: "
-                "mean=%.0f min=%d max=%d (nominal targets=%s).",
+                "Prepared %d NIAH samples. Actual token length: "
+                "mean=%.0f min=%d max=%d.",
                 len(samples), lengths.mean(), lengths.min(), lengths.max(),
-                context_lengths,
             )
         else:
-            logger.info("Generated 0 NIAH samples.")
+            logger.info("Prepared 0 NIAH samples.")
         return samples
 
     # ------------------------------------------------------------------
