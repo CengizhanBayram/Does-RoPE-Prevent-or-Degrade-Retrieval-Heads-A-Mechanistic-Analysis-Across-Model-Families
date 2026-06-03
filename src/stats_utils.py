@@ -23,6 +23,32 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Set overlap (used by the quantization ablation, A2)
+# ---------------------------------------------------------------------------
+
+def jaccard(set_a, set_b) -> dict:
+    """
+    Jaccard similarity and symmetric difference of two collections.
+
+    Returns a dict with: jaccard, intersection, union, only_a, only_b,
+    n_a, n_b. Used to compare retrieval-head sets across conditions (e.g.
+    fp16 vs 8-bit) — a head count can match while the *identities* differ.
+    """
+    a, b = set(map(tuple, set_a)), set(map(tuple, set_b))
+    inter = a & b
+    union = a | b
+    return {
+        "jaccard": (len(inter) / len(union)) if union else 1.0,
+        "intersection": len(inter),
+        "union": len(union),
+        "only_a": sorted(a - b),
+        "only_b": sorted(b - a),
+        "n_a": len(a),
+        "n_b": len(b),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Effect size
 # ---------------------------------------------------------------------------
 

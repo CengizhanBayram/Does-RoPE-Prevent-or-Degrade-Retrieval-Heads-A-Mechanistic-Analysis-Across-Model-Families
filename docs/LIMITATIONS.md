@@ -37,9 +37,17 @@ plainly either way.
   heads/models but is not directly comparable to numbers reported with the
   original method.
 
-- **A2 — Quantization.** All models are loaded in 8-bit by default. Quantization
-  perturbs attention distributions and can shift retrieval-head detection. Run
-  the fp16 ablation (`--no_8bit`) on at least one model and report the delta.
+- **A2 — Quantization.** All models load in 8-bit by default. Because detection
+  is argmax-based (discrete), a tiny continuous rounding shift can flip a head's
+  argmax when its top-2 positions are close — quantization can move detection
+  more than "slightly". `scripts/run_quant_ablation.py` (8-bit vs fp16, one
+  representative model, seq=4096) reports THREE levels for BOTH the argmax score
+  and the quantization-robust **mass score** (needle-span attention mass, via
+  `score_heads(return_mass=True)`): (1) head-set Jaccard overlap, (2) per-head
+  score correlation, (3) whether the retrieval-vs-non-retrieval utility gap
+  keeps the same sign/significance. Defend stability of the *finding direction*,
+  not byte-identical head sets. One model suffices (architecture-independent
+  numerical artifact); the verdict is written to `quant_ablation_<model>.json`.
 
 - **A3 — Confounded cross-family comparison.** "Higher RoPE θ → fewer retrieval
   heads" (H1) is confounded across model families by training data, scale, and
@@ -71,7 +79,17 @@ plainly either way.
 - **B2 — Multiple comparisons.** Cross-model tests are FDR-corrected
   (Benjamini-Hochberg, `results/layer_a/fdr_summary.json`).
 - **B3 — Seed variance.** Run multiple seeds (`--seeds` / `config niah.seeds`);
-  `seed_aggregate.json` reports mean ± SD of the headline metrics.
+  `seed_aggregate.json` reports mean ± SD of the headline metrics. Report e.g.
+  "47 ± 3 retrieval heads (5 seeds)", not a single number.
+- **§2.3 — Paired-seed control.** Seeds are *NIAH-sampling* seeds (weights are
+  fixed). For cross-model comparison the SAME seed must yield identical data for
+  every model. We enforce this in two stages: `generate_niah_specs(seed)`
+  produces tokenizer-independent text specs (RNG consumption never depends on a
+  tokenizer), and `paired_spec_subset` keeps only specs that tokenize in EVERY
+  model (intersection-drop) so all models are scored on an equal n. Dropped
+  specs are logged. Layer B is single-seed per checkpoint (full sweep) with a
+  5-seed crystallization-step validation (`run_layer_b.py --validate_steps`).
+  Regression-guarded by `tests/test_paired_seed.py`.
 - **B4 — Effect sizes.** Cohen's d and bootstrap 95% CIs accompany every mean
   comparison; the Layer-D causal effect also carries a bootstrap CI.
 - **B5 — Correlation choice.** Retrieval scores are zero-inflated; Spearman's

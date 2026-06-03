@@ -98,7 +98,12 @@ def load_haystack_corpus(max_sentences: int = 5000) -> list[str]:
         from datasets import load_dataset  # type: ignore
 
         logger.info("Loading PG-19 haystack corpus (max %d sentences) …", max_sentences)
-        ds = load_dataset("pg19", split="train", streaming=True)
+        # PG-19 ships a custom loading script → trust_remote_code is required on
+        # modern `datasets`; without it load_dataset raises and we silently fall
+        # back to the tiny hardcoded corpus (much less diverse haystack).
+        ds = load_dataset(
+            "pg19", split="train", streaming=True, trust_remote_code=True
+        )
         sentences: list[str] = []
         for example in ds:
             for sent in example["text"].split(". "):

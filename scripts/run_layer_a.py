@@ -34,7 +34,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.dimension_utility import DimensionUtilityAnalyzer
 from src.model_loader import load_model as _load_model_shared
 from src.repro import capture_environment, set_determinism
-from src.retrieval_head_detector import RetrievalHeadDetector
+from src.retrieval_head_detector import (
+    RetrievalHeadDetector,
+    generate_niah_specs,
+    paired_spec_subset,
+)
 from src.stats_utils import benjamini_hochberg
 from src.visualization import (
     plot_dimension_utility_profile,
@@ -114,6 +118,7 @@ def run_analysis(
     seed: int = 42,
     load_in_8bit: bool | None = None,
     persist: bool = True,
+    specs: list[dict] | None = None,
 ) -> dict:
     """
     Run the full Layer-A pipeline for a single model.
@@ -122,6 +127,9 @@ def run_analysis(
         persist: When True, write results.json and norms.npy to disk. Set False
             for the extra seeds of a multi-seed run (item B3) so the primary
             seed's artifacts (consumed by Layer D) are not overwritten.
+        specs: Pre-generated, intersection-filtered NIAH specs for paired-seed
+            comparison (§2.3). When None, samples are generated for this model
+            alone (no cross-model pairing).
 
     Returns the result dict (also written to disk when persist=True).
     """
@@ -142,15 +150,19 @@ def run_analysis(
     model, tokenizer = _load_model(model_name, model_cfg, load_in_8bit=load_in_8bit)
 
     # --- Retrieval head detection ---
-    logger.info("[%s] Generating NIAH samples …", model_name)
+    logger.info("[%s] Preparing NIAH samples …", model_name)
     detector = RetrievalHeadDetector(
         model, tokenizer, config, score_threshold=score_threshold, seed=seed
     )
-    samples = detector.generate_niah_samples(
-        n_samples=n_samples,
-        context_lengths=context_lengths,
-        needle_positions=needle_positions,
-    )
+    if specs is not None:
+        # Paired-seed path: identical, intersection-filtered specs across models.
+        samples = detector.prepare_samples(specs)
+    else:
+        samples = detector.generate_niah_samples(
+            n_samples=n_samples,
+            context_lengths=context_lengths,
+            needle_positions=needle_positions,
+        )
 
     logger.info("[%s] Scoring retrieval heads …", model_name)
     scores = detector.score_heads(samples)
@@ -363,24 +375,47 @@ def main() -> None:
     seeds = args.seeds or config["niah"].get("seeds") or [args.seed]
     logger.info("Running with seeds: %s", seeds)
 
-    model_keys = (
-        list(config["models"].keys())
-        if args.model == "all"
-        else [args.model]
-    )
+    model_keys = [
+        m for m in (
+            list(config["models"].keys()) if args.model == "all" else [args.model]
+        )
+        if m in config["models"]
+    ]
+    if not model_keys:
+        logger.error("No valid models selected.")
+        return
 
-    all_results: dict[str, dict] = {}  # primary-seed result per model (for figures)
+    context_lengths = config["niah"]["context_lengths"]
+    needle_positions = config["niah"]["needle_positions"]
+    paired = len(model_keys) > 1
 
-    for model_name in model_keys:
-        if model_name not in config["models"]:
-            logger.error("Model '%s' not found in config.", model_name)
-            continue
-        logger.info("=" * 60)
-        logger.info("Starting analysis: %s (seeds=%s)", model_name, seeds)
-        logger.info("=" * 60)
+    # Pre-load tokenizers once for the paired-seed intersection (§2.3). Cheap —
+    # tokenizers are tiny and model weights are not loaded here.
+    tokenizers: dict[str, object] = {}
+    if paired:
+        from transformers import AutoTokenizer
+        for m in model_keys:
+            cfg = config["models"][m]
+            tokenizers[m] = AutoTokenizer.from_pretrained(
+                cfg["hf_id"], revision=cfg.get("revision") or "main",
+                trust_remote_code=True,
+            )
+        logger.info("Paired-seed control ON across models: %s", model_keys)
 
-        per_seed: list[dict] = []
-        for idx, seed in enumerate(seeds):
+    # seed-OUTER so every model sees the identical spec subset for a given seed.
+    per_seed_by_model: dict[str, list[dict]] = {m: [] for m in model_keys}
+    for idx, seed in enumerate(seeds):
+        specs = generate_niah_specs(seed, n_samples, context_lengths, needle_positions)
+        if paired:
+            specs, dropped = paired_spec_subset(specs, tokenizers)
+            logger.info(
+                "seed=%d: %d paired specs kept (dropped %d): %s",
+                seed, len(specs), len(dropped), dropped,
+            )
+        for model_name in model_keys:
+            logger.info("=" * 60)
+            logger.info("Analysis: %s  seed=%d", model_name, seed)
+            logger.info("=" * 60)
             try:
                 res = run_analysis(
                     model_name=model_name,
@@ -390,19 +425,22 @@ def main() -> None:
                     results_dir=results_dir,
                     seed=seed,
                     load_in_8bit=load_in_8bit,
-                    persist=(idx == 0),  # only primary seed writes the canonical artifacts
+                    persist=(idx == 0),  # only primary seed writes canonical artifacts
+                    specs=specs,
                 )
-                per_seed.append(res)
+                per_seed_by_model[model_name].append(res)
             except Exception as exc:
                 logger.error(
                     "Analysis failed for %s seed=%d: %s", model_name, seed, exc,
                     exc_info=True,
                 )
 
+    all_results: dict[str, dict] = {}  # primary-seed result per model (for figures)
+    for model_name in model_keys:
+        per_seed = per_seed_by_model[model_name]
         if not per_seed:
             continue
         all_results[model_name] = per_seed[0]
-
         if len(per_seed) > 1:
             agg = _aggregate_seed_summaries(per_seed)
             agg_path = results_dir / "layer_a" / model_name / "seed_aggregate.json"

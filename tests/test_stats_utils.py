@@ -9,7 +9,28 @@ from src.stats_utils import (
     bootstrap_mean_diff_ci,
     clustered_permutation_test,
     cohens_d,
+    jaccard,
 )
+
+
+def test_jaccard_identical_sets():
+    heads = [(0, 1), (2, 3), (5, 7)]
+    r = jaccard(heads, heads)
+    assert r["jaccard"] == 1.0
+    assert r["only_a"] == [] and r["only_b"] == []
+
+
+def test_jaccard_partial_overlap():
+    a = [(0, 0), (1, 1), (2, 2)]
+    b = [(1, 1), (2, 2), (3, 3)]
+    r = jaccard(a, b)
+    assert r["intersection"] == 2 and r["union"] == 4
+    assert abs(r["jaccard"] - 0.5) < 1e-9
+    assert r["only_a"] == [(0, 0)] and r["only_b"] == [(3, 3)]
+
+
+def test_jaccard_empty_sets():
+    assert jaccard([], [])["jaccard"] == 1.0
 
 
 def test_cohens_d_sign_and_zero():

@@ -385,19 +385,29 @@ class RetrievalHeadDetector:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def score_heads(self, samples: list[dict]) -> np.ndarray:
+    def score_heads(self, samples: list[dict], return_mass: bool = False):
         """
-        Score every attention head on NIAH hit rate.
+        Score every attention head on NIAH retrieval.
 
-        Uses forward hooks on each self_attn module so that each layer's
-        attention matrix is processed and freed before the next layer runs.
-        Peak VRAM is O(seq_len²) per layer rather than O(n_layers · seq_len²).
+        Two complementary metrics are computed in a single pass:
+          - argmax score: hit rate that the last-token attention argmax lands on
+            the needle span (discrete; the original metric).
+          - mass score: mean attention *mass* the last token places on the
+            needle span (continuous). Because it has no argmax threshold to
+            jump, it is structurally more robust to quantization rounding — use
+            it as the companion metric in the A2 ablation.
+
+        Uses forward hooks on each self_attn module so each layer's attention
+        matrix is processed and freed before the next layer runs (peak VRAM
+        O(seq_len²) per layer).
 
         Args:
-            samples: Output of generate_niah_samples().
+            samples: Output of generate_niah_samples()/prepare_samples().
+            return_mass: When True, return {"argmax": ndarray, "mass": ndarray};
+                when False (default), return only the argmax hit-rate ndarray.
 
         Returns:
-            np.ndarray of shape (n_layers, n_heads) with hit rates in [0, 1].
+            (n_layers, n_heads) hit-rate ndarray, or a dict with both metrics.
         """
         device = self._get_device()
         n_layers, n_heads = self._get_n_layers_heads()
@@ -405,6 +415,7 @@ class RetrievalHeadDetector:
 
         hit_counts = np.zeros((n_layers, n_heads), dtype=np.int32)
         total_counts = np.zeros((n_layers, n_heads), dtype=np.int32)
+        mass_sums = np.zeros((n_layers, n_heads), dtype=np.float64)
 
         # Track whether any layer ever returned attention weights
         attn_weights_seen: list[bool] = [False]
@@ -469,15 +480,18 @@ class RetrievalHeadDetector:
                 if "input_ids" in dir():
                     del input_ids
 
-            # Update hit/total counts from captured attention rows
+            # Update hit/total/mass counts from captured attention rows
             for layer_idx, attn_last in captured.items():
                 # attn_last: (n_heads_captured, seq_len)
                 n_heads_captured = attn_last.shape[0]
                 argmax_positions = attn_last.argmax(dim=-1).numpy()
+                # Continuous needle-span attention mass per head.
+                needle_mass = attn_last[:, needle_start:needle_end].sum(dim=-1).numpy()
 
                 # Handle MQA: single KV head shared across all Q heads
                 if n_heads_captured == 1 and n_heads > 1:
                     argmax_positions = np.repeat(argmax_positions, n_heads)
+                    needle_mass = np.repeat(needle_mass, n_heads)
                     n_heads_captured = n_heads
 
                 for head_idx in range(min(n_heads_captured, n_heads)):
@@ -485,6 +499,7 @@ class RetrievalHeadDetector:
                     total_counts[layer_idx, head_idx] += 1
                     if needle_start <= pos < needle_end:
                         hit_counts[layer_idx, head_idx] += 1
+                    mass_sums[layer_idx, head_idx] += float(needle_mass[head_idx])
 
             captured.clear()
             if i % 10 == 9:
@@ -499,18 +514,20 @@ class RetrievalHeadDetector:
             )
 
         with np.errstate(invalid="ignore"):
-            scores = np.where(
-                total_counts > 0,
-                hit_counts / total_counts,
-                0.0,
-            )
+            scores = np.where(total_counts > 0, hit_counts / total_counts, 0.0)
+            mass_scores = np.where(total_counts > 0, mass_sums / total_counts, 0.0)
 
         logger.info(
-            "Scoring complete. Max score: %.3f, heads above threshold (%.2f): %d",
-            scores.max(),
-            self.score_threshold,
-            int((scores >= self.score_threshold).sum()),
+            "Scoring complete. Max argmax-score: %.3f, heads above threshold "
+            "(%.2f): %d | max mass-score: %.3f",
+            scores.max(), self.score_threshold,
+            int((scores >= self.score_threshold).sum()), mass_scores.max(),
         )
+        if return_mass:
+            return {
+                "argmax": scores.astype(np.float32),
+                "mass": mass_scores.astype(np.float32),
+            }
         return scores.astype(np.float32)
 
     def get_retrieval_heads(self, scores: np.ndarray) -> list[tuple[int, int]]:

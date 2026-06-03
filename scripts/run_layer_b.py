@@ -176,6 +176,46 @@ def load_all_checkpoint_results(results_dir: Path) -> list[dict]:
     return results
 
 
+def validate_crystallization(steps, config, results_dir, loader, seeds) -> None:
+    """
+    Multi-seed validation of specific checkpoints (item B3, crystallization).
+
+    Layer B uses one seed per checkpoint for the full 500-checkpoint sweep
+    (multi-seeding all of them is prohibitive). To show the crystallization step
+    is stable to NIAH sampling noise, re-run a few targeted steps across seeds
+    and report mean +/- SD. Single-model (OLMo) → automatically paired across
+    seeds via the shared tokenizer.
+    """
+    all_revs = loader.list_available_checkpoints()
+    by_step = {loader.get_step_from_revision(r): r for r in all_revs}
+    out = {}
+    for step in steps:
+        rev = by_step.get(step)
+        if rev is None:
+            logger.warning("Step %d not found among available checkpoints.", step)
+            continue
+        heads = []
+        for sd in seeds:
+            res = process_checkpoint(rev, step, loader, config, results_dir, seed=sd)
+            if res is not None:
+                heads.append(res["summary"]["n_retrieval_heads"])
+        if heads:
+            out[step] = {
+                "seeds": seeds,
+                "n_retrieval_heads_mean": float(np.mean(heads)),
+                "n_retrieval_heads_std": float(np.std(heads, ddof=1)) if len(heads) > 1 else 0.0,
+                "values": heads,
+            }
+            logger.info("Step %d crystallization: %.1f +/- %.1f heads over %d seeds",
+                        step, out[step]["n_retrieval_heads_mean"],
+                        out[step]["n_retrieval_heads_std"], len(heads))
+    path = results_dir / "layer_b" / "crystallization_validation.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(out, f, indent=2)
+    logger.info("Crystallization validation saved to %s", path)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Layer B: OLMo-2 training dynamics")
     parser.add_argument("--step_stride", type=int, default=None)
@@ -186,6 +226,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--config", type=str, default="configs/config.yaml")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--validate_steps", type=int, nargs="+", default=None,
+        help="Instead of the full sweep, multi-seed validate only these steps "
+             "(crystallization check, item B3). Uses config niah.seeds.",
+    )
     return parser.parse_args()
 
 
@@ -203,6 +248,14 @@ def main() -> None:
     fig_fmt = config.get("output", {}).get("figure_format", "pdf")
 
     loader = OLMoCheckpointLoader(config)
+
+    # Crystallization validation mode: multi-seed a few targeted steps, then exit.
+    if args.validate_steps:
+        seeds = config["niah"].get("seeds", [42, 123, 2024])
+        logger.info("Crystallization validation on steps %s with seeds %s",
+                    args.validate_steps, seeds)
+        validate_crystallization(args.validate_steps, config, results_dir, loader, seeds)
+        return
 
     logger.info("Listing available checkpoints …")
     filtered = loader.get_filtered_checkpoints(step_stride=step_stride)

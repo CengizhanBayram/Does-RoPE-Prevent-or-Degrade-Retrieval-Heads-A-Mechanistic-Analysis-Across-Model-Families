@@ -30,7 +30,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.dimension_utility import DimensionUtilityAnalyzer
 from src.model_loader import load_model as _load_model_shared
 from src.repro import capture_environment, set_determinism
-from src.retrieval_head_detector import RetrievalHeadDetector
+from src.retrieval_head_detector import (
+    RetrievalHeadDetector,
+    generate_niah_specs,
+    paired_spec_subset,
+)
 from src.visualization import (
     plot_dimension_utility_profile,
     plot_theta_comparison_heatmaps,
@@ -96,8 +100,16 @@ def analyse_model(
     config: dict,
     results_dir: Path,
     seed: int = 42,
+    specs: list[dict] | None = None,
+    persist: bool = True,
 ) -> dict:
-    """Run the Layer-A pipeline for one model and return the result dict."""
+    """Run the Layer-A pipeline for one model and return the result dict.
+
+    Args:
+        specs: Pre-generated, intersection-filtered NIAH specs for paired-seed
+            comparison (§2.3). When None, samples are generated for this model.
+        persist: Write results.json/norms.npy only when True (primary seed).
+    """
     strict = config.get("reproducibility", {}).get("strict_determinism", False)
     set_determinism(seed, strict=strict)
     niah_cfg = config["niah"]
@@ -105,12 +117,7 @@ def analyse_model(
 
     out_dir = results_dir / "layer_c" / model_name
     out_dir.mkdir(parents=True, exist_ok=True)
-
     result_path = out_dir / "results.json"
-    if result_path.exists():
-        logger.info("Loading cached results for %s.", model_name)
-        with open(result_path) as f:
-            return json.load(f)
 
     model, tokenizer = _load_model(model_name, model_cfg)
 
@@ -119,11 +126,14 @@ def analyse_model(
         score_threshold=niah_cfg.get("score_threshold", 0.1),
         seed=seed,
     )
-    samples = detector.generate_niah_samples(
-        n_samples=n_samples,
-        context_lengths=niah_cfg["context_lengths"],
-        needle_positions=niah_cfg["needle_positions"],
-    )
+    if specs is not None:
+        samples = detector.prepare_samples(specs)
+    else:
+        samples = detector.generate_niah_samples(
+            n_samples=n_samples,
+            context_lengths=niah_cfg["context_lengths"],
+            needle_positions=niah_cfg["needle_positions"],
+        )
     scores = detector.score_heads(samples)
     retrieval_heads = detector.get_retrieval_heads(scores)
 
@@ -133,7 +143,8 @@ def analyse_model(
     correlation = analyzer.compute_retrieval_utility_correlation(scores, norms)
     freq_profile = analyzer.dimension_profile_by_frequency(norms, retrieval_heads)
 
-    np.save(out_dir / "norms.npy", norms)
+    if persist:
+        np.save(out_dir / "norms.npy", norms)
 
     n_layers, n_heads = scores.shape
     stat_tests = {
@@ -173,8 +184,9 @@ def analyse_model(
         },
     }
 
-    with open(result_path, "w") as f:
-        json.dump(result, f, indent=2)
+    if persist:
+        with open(result_path, "w") as f:
+            json.dump(result, f, indent=2)
 
     _unload(model)
     return result
@@ -226,7 +238,52 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Layer C: θ comparison")
     parser.add_argument("--config", type=str, default="configs/config.yaml")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seeds", type=int, nargs="+", default=None,
+        help="Multiple PAIRED NIAH seeds (item B3 / §2.3). Defaults to config "
+             "niah.seeds, else [--seed].",
+    )
     return parser.parse_args()
+
+
+def _run_paired(config, results_dir, seeds):
+    """Run LLaMA-2 vs LLaMA-3.1 across PAIRED seeds; return primary results + aggregates."""
+    from transformers import AutoTokenizer
+
+    models = ["llama2", "llama3"]
+    niah = config["niah"]
+    tokenizers = {
+        m: AutoTokenizer.from_pretrained(
+            config["models"][m]["hf_id"],
+            revision=config["models"][m].get("revision") or "main",
+            trust_remote_code=True,
+        )
+        for m in models
+    }
+
+    per_seed = {m: [] for m in models}
+    for idx, seed in enumerate(seeds):
+        specs = generate_niah_specs(seed, niah["n_samples"],
+                                    niah["context_lengths"], niah["needle_positions"])
+        specs, dropped = paired_spec_subset(specs, tokenizers)
+        logger.info("seed=%d: %d paired specs (dropped %d)", seed, len(specs), len(dropped))
+        for m in models:
+            res = analyse_model(m, config["models"][m], config, results_dir,
+                                seed=seed, specs=specs, persist=(idx == 0))
+            per_seed[m].append(res)
+
+    primary = {m: per_seed[m][0] for m in models}
+    if len(seeds) > 1:
+        for m in models:
+            heads = [r["summary"]["n_retrieval_heads"] for r in per_seed[m]]
+            agg = {"seeds": seeds, "n_retrieval_heads_mean": float(np.mean(heads)),
+                   "n_retrieval_heads_std": float(np.std(heads, ddof=1)),
+                   "n_retrieval_heads_values": heads}
+            with open(results_dir / "layer_c" / m / "seed_aggregate.json", "w") as f:
+                json.dump(agg, f, indent=2)
+            logger.info("[%s] retrieval heads = %.1f ± %.1f over %d seeds",
+                        m, agg["n_retrieval_heads_mean"], agg["n_retrieval_heads_std"], len(seeds))
+    return primary["llama2"], primary["llama3"]
 
 
 def main() -> None:
@@ -238,12 +295,10 @@ def main() -> None:
     results_dir = Path(config.get("output", {}).get("results_dir", "./results"))
     fig_dpi = config.get("output", {}).get("figures_dpi", 300)
     fig_fmt = config.get("output", {}).get("figure_format", "pdf")
+    seeds = args.seeds or config["niah"].get("seeds") or [args.seed]
+    logger.info("Layer C paired seeds: %s", seeds)
 
-    logger.info("Analysing LLaMA-2 (θ=10K) …")
-    llama2_res = analyse_model("llama2", config["models"]["llama2"], config, results_dir, seed=args.seed)
-
-    logger.info("Analysing LLaMA-3.1 (θ=500K) …")
-    llama3_res = analyse_model("llama3", config["models"]["llama3"], config, results_dir, seed=args.seed)
+    llama2_res, llama3_res = _run_paired(config, results_dir, seeds)
 
     # Save comparison JSON
     comparison_path = results_dir / "layer_c" / "comparison.json"
