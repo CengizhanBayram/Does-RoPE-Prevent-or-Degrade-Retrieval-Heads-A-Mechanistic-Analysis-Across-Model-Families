@@ -9,11 +9,24 @@ from src.stats_utils import (
     bootstrap_mean_diff_ci,
     clustered_permutation_test,
     cohens_d,
+    crystallization_onset,
     jaccard,
     layer_zscore,
     lead_lag,
     partial_correlation,
 )
+
+
+def test_crystallization_onset_ignores_later_dip_recovery():
+    # Low baseline ~10, sharp rise to ~45 at index 5, then a dip→recovery spike
+    # near the end (the argmax(diff) trap). Onset must be the rise (~index 5),
+    # NOT the late recovery.
+    series = [10, 10, 11, 10, 12, 45, 44, 46, 43, 11, 48]
+    assert crystallization_onset(series) == 5
+
+
+def test_crystallization_onset_short_series():
+    assert crystallization_onset([1, 2]) == 0
 
 
 def test_partial_correlation_removes_layer_confound():

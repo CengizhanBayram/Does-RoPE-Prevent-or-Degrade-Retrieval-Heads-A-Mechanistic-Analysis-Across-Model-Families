@@ -271,14 +271,20 @@ def plot_olmo_training_dynamics(
     ax2.plot(steps, top20_utility, color=color_util, linewidth=2, marker="s", markersize=4, linestyle="--", label="Top-20 mean utility")
 
     if len(n_heads_list) > 2:
-        diffs = np.diff(n_heads_list)
-        cryst_idx = int(np.argmax(diffs)) + 1
-        cryst_step = steps[cryst_idx]
-        ax1.axvline(cryst_step, color="gray", linestyle=":", linewidth=1.5)
+        # P7 FIX: crystallization = ONSET of the sustained rise, not the single
+        # largest first-difference. argmax(diff) is fooled by a later dip→recovery
+        # spike (e.g. the ~3050B outlier), mislabelling the onset. Instead take
+        # the FIRST checkpoint whose (smoothed) head count crosses the midpoint
+        # between the early baseline and the peak — robust to later dips.
+        from src.stats_utils import crystallization_onset
+        cryst_idx = crystallization_onset(n_heads_list)
+        cryst_x = steps[cryst_idx]
+        unit = "B tokens" if x_label.startswith("Tokens") else "step"
+        ax1.axvline(cryst_x, color="gray", linestyle=":", linewidth=1.5)
         ax1.annotate(
-            f"Crystallization\nstep={cryst_step:,}",
-            xy=(cryst_step, n_heads_list[cryst_idx]),
-            xytext=(cryst_step + (steps[-1] - steps[0]) * 0.03, max(n_heads_list) * 0.8),
+            f"Crystallization onset\n~{cryst_x:,} {unit}",
+            xy=(cryst_x, n_heads_list[cryst_idx]),
+            xytext=(cryst_x + (steps[-1] - steps[0]) * 0.03, max(n_heads_list) * 0.8),
             arrowprops=dict(arrowstyle="->", color="gray"),
             fontsize=8,
         )

@@ -160,6 +160,27 @@ def lead_lag(
             "p_value": float(p), "lags": lags, "corrs": corrs}
 
 
+def crystallization_onset(n_heads_series: Sequence[float]) -> int:
+    """
+    Index of the crystallization ONSET in a retrieval-head-count training series.
+
+    Returns the first checkpoint whose count crosses the midpoint between the
+    early baseline (median of the first ~20%) and the peak. This is robust to a
+    later dip→recovery spike that fools a naive argmax(first-difference) — item
+    P7. Falls back to argmax(diff)+1 if no crossing is found.
+    """
+    heads = np.asarray(n_heads_series, dtype=np.float64)
+    if len(heads) < 3:
+        return 0
+    k = max(1, len(heads) // 5)
+    baseline = float(np.median(heads[:k]))
+    peak = float(heads.max())
+    crossings = np.where(heads >= (baseline + peak) / 2.0)[0]
+    if len(crossings):
+        return int(crossings[0])
+    return int(np.argmax(np.diff(heads))) + 1
+
+
 def layer_zscore(values: np.ndarray) -> np.ndarray:
     """
     Z-score a (n_layers, n_heads) matrix WITHIN each layer (item P3).
