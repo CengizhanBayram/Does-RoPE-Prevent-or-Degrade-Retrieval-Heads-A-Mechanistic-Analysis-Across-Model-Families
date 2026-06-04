@@ -75,29 +75,49 @@ class ActivationPatcher:
         layer = self.model.model.layers[layer_idx]
         hooks = []
         head_dim = self._get_head_dim()
+        n_heads, n_kv_heads = self._get_n_heads_kv()
+        group_size = max(1, n_heads // max(1, n_kv_heads))
+        # FIX P2 (GQA): q_proj outputs all n_heads query heads, so the query head
+        # lives at head_idx*head_dim. But k_proj outputs only n_kv_heads heads;
+        # query head_idx maps to KV head (head_idx // group_size). Using
+        # head_idx*head_dim into k_proj is out of bounds for GQA (e.g. LLaMA-3:
+        # 32 q heads, 8 kv heads → head_idx 31 → 3968 >> 1024).
+        kv_head_idx = head_idx // group_size
 
-        def _make_hook(proj_name: str):
+        def _make_hook(is_kv: bool):
+            start = (kv_head_idx if is_kv else head_idx) * head_dim
+
             def hook(module, input_: Any, output: Tensor) -> Tensor:
-                # output shape: (batch, seq_len, hidden_dim)
+                # output shape: (batch, seq_len, n_proj_heads * head_dim)
                 out = output.clone()
-                start = head_idx * head_dim
+                width = out.shape[-1]
                 for d in dims_to_zero:
-                    if 0 <= d < head_dim:
-                        out[:, :, start + d] = 0.0
+                    col = start + d
+                    if 0 <= d < head_dim and col < width:
+                        out[:, :, col] = 0.0
                 return out
             return hook
 
         try:
             if "q" in mode:
-                h = layer.self_attn.q_proj.register_forward_hook(_make_hook("q_proj"))
+                h = layer.self_attn.q_proj.register_forward_hook(_make_hook(is_kv=False))
                 hooks.append(h)
             if "k" in mode:
-                h = layer.self_attn.k_proj.register_forward_hook(_make_hook("k_proj"))
+                h = layer.self_attn.k_proj.register_forward_hook(_make_hook(is_kv=True))
                 hooks.append(h)
             yield
         finally:
             for h in hooks:
                 h.remove()
+
+    def _get_n_heads_kv(self) -> tuple[int, int]:
+        """Return (num_attention_heads, num_key_value_heads). MHA → kv == heads."""
+        cfg = getattr(self.model, "config", None)
+        n_heads = getattr(cfg, "num_attention_heads", 32) if cfg else 32
+        n_kv = getattr(cfg, "num_key_value_heads", None) if cfg else None
+        if n_kv is None:
+            n_kv = n_heads  # MHA (e.g. LLaMA-2)
+        return int(n_heads), int(n_kv)
 
     def _get_head_dim(self) -> int:
         """Return per-head dimension, preferring explicit config field."""

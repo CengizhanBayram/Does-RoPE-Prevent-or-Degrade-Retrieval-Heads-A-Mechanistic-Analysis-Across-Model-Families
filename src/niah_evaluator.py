@@ -84,26 +84,43 @@ class NIAHEvaluator:
 
         Returns:
             Full prompt string ending with "Answer:".
+
+        FIX P1: token-aware budgeting. The old char budget (context_length * 4)
+        overshot the token count, so the tokenizer right-truncated the prompt and
+        ATE the trailing "...Answer:" query → the model got no question and
+        scored 0 at long contexts. We now trim the HAYSTACK to a token budget that
+        leaves room for the needle + query, so both always survive.
         """
+        needle = f"The secret passphrase is {code}."
+        query = "What is the secret passphrase?"
+        tok = self.tokenizer
+
+        reserve = (
+            len(tok(needle, add_special_tokens=False)["input_ids"])
+            + len(tok(query, add_special_tokens=False)["input_ids"])
+            + 16  # formatting / BOS / newlines margin
+        )
+        budget = max(16, context_length - reserve)
+
+        # Fast char pass (generous upper bound), then trim to the token budget.
         parts: list[str] = []
         total_chars = 0
-        char_budget = context_length * 4
         rng_sents = sentences.copy()
         self._rng.shuffle(rng_sents)
         for sent in rng_sents:
             parts.append(sent)
             total_chars += len(sent) + 1
-            if total_chars >= char_budget:
+            if total_chars >= budget * 6:  # ~6 chars/token upper bound
                 break
         haystack = " ".join(parts)
 
-        needle = f"The secret passphrase is {code}."
+        hay_ids = tok(haystack, add_special_tokens=False)["input_ids"][:budget]
+        haystack = tok.decode(hay_ids)
+
         words = haystack.split()
         insert_idx = max(0, min(int(len(words) * needle_position), len(words) - 1))
         words.insert(insert_idx, needle)
         full_text = " ".join(words)
-
-        query = "What is the secret passphrase?"
         return f"{full_text}\n\n{query}\n\nAnswer:"
 
     # ------------------------------------------------------------------
@@ -154,11 +171,14 @@ class NIAHEvaluator:
                     input_ids = None  # initialise so finally block is safe
                     out = None
                     try:
+                        # Generous max_length: build_prompt already trims the
+                        # haystack to ~ctx_len tokens, so this no longer cuts the
+                        # trailing query (FIX P1). The +512 is pure safety margin.
                         encoding = self.tokenizer(
                             prompt,
                             return_tensors="pt",
                             truncation=True,
-                            max_length=ctx_len + 64,
+                            max_length=ctx_len + 512,
                         )
                         input_ids = encoding["input_ids"].to(device)
 
@@ -191,7 +211,17 @@ class NIAHEvaluator:
                             del out
                         torch.cuda.empty_cache()
 
-                acc_matrix[i, j] = correct / total if total > 0 else 0.0
+                # FIX P1: distinguish "0% accuracy" from "no sample completed"
+                # (e.g. every sample OOM'd). NaN prevents a silent OOM from being
+                # plotted/reported as a real 0.00 score.
+                if total == 0:
+                    logger.warning(
+                        "ctx_len=%d pos=%.2f: 0/%d samples completed (all skipped/OOM) "
+                        "→ NaN, not 0.", ctx_len, pos, samples_per_combo,
+                    )
+                    acc_matrix[i, j] = np.nan
+                else:
+                    acc_matrix[i, j] = correct / total
 
         return acc_matrix
 

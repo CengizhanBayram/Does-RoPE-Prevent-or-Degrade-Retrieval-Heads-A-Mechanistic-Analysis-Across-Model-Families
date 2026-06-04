@@ -49,6 +49,15 @@ plainly either way.
   not byte-identical head sets. One model suffices (architecture-independent
   numerical artifact); the verdict is written to `quant_ablation_<model>.json`.
 
+- **P10 — Layer C (θ) is confounded, not a clean θ manipulation.** LLaMA-2 vs
+  LLaMA-3.1 differ in RoPE θ (10K vs 500K) **and** in pretraining data, token
+  count, tokenizer, and attention scheme (MHA vs GQA). So a Layer-C difference
+  (or null) cannot be attributed to θ alone. State this explicitly: causal θ
+  isolation rests on (a) Layer D's within-model frequency patching (§6) and
+  (b) a future single-model θ-sweep (retrain/finetune one model at several θ).
+  Report Layer C as *suggestive*, with multi-seed CIs (e.g. "31±4 vs 28±3,
+  difference not significant").
+
 - **A3 — Confounded cross-family comparison.** "Higher RoPE θ → fewer retrieval
   heads" (H1) is confounded across model families by training data, scale, and
   architecture. Causal language should be reserved for the controlled

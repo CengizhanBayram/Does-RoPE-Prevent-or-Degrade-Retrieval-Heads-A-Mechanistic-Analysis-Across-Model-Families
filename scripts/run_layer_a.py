@@ -197,6 +197,10 @@ def run_analysis(
         "pearson_p": correlation["pearson_p"],
         "spearman_rho": correlation["spearman_rho"],
         "spearman_p": correlation["spearman_p"],
+        "partial_spearman_r": correlation.get("partial_spearman_r"),
+        "partial_p": correlation.get("partial_p"),
+        "partial_ci_low": correlation.get("partial_ci_low"),
+        "partial_ci_high": correlation.get("partial_ci_high"),
     }
 
     actual_lengths = [s["actual_token_length"] for s in samples] if samples else []
@@ -218,6 +222,7 @@ def run_analysis(
         "retrieval_scores": scores.tolist(),
         "dimension_utility": {
             "per_head_scalar": utility_stats["per_head_scalar"],
+            "per_head_scalar_zscore": utility_stats.get("per_head_scalar_zscore"),
             "frequency_profile": freq_profile,
         },
         "statistical_tests": stat_tests,

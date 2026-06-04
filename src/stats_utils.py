@@ -23,6 +23,160 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Layer-controlled partial correlation (item P4)
+# ---------------------------------------------------------------------------
+
+def _residualize_within_group(x: np.ndarray, group: np.ndarray) -> np.ndarray:
+    """Subtract each group's mean (categorical control = within-layer demean)."""
+    out = np.array(x, dtype=np.float64)
+    for c in np.unique(group):
+        m = group == c
+        out[m] = out[m] - out[m].mean()
+    return out
+
+
+def partial_correlation(
+    x: Sequence[float],
+    y: Sequence[float],
+    control: Sequence,
+    *,
+    method: str = "spearman",
+    n_boot: int = 5000,
+    seed: int = 42,
+) -> dict:
+    """
+    Correlation of x and y after controlling for a categorical ``control``
+    (here: the layer index) — item P4.
+
+    Layer drives BOTH retrieval tendency and the L1-norm scale, so the raw
+    correlation is confounded. We remove each variable's per-layer mean and
+    correlate the residuals, with a LAYER-CLUSTERED bootstrap CI (resample whole
+    layers, not individual heads — respects non-independence, item B1).
+
+    Returns: partial_r, p_value, ci_low, ci_high, method, n_clusters.
+    """
+    from scipy import stats as _st
+
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    g = np.asarray(control)
+
+    def _corr(xr, yr):
+        if len(np.unique(xr)) < 2 or len(np.unique(yr)) < 2:
+            return float("nan")
+        if method == "pearson":
+            return float(_st.pearsonr(xr, yr)[0])
+        return float(_st.spearmanr(xr, yr)[0])
+
+    rx, ry = _residualize_within_group(x, g), _residualize_within_group(y, g)
+    if method == "pearson":
+        r, p = (float("nan"), float("nan")) if len(np.unique(rx)) < 2 else _st.pearsonr(rx, ry)
+    else:
+        r, p = (float("nan"), float("nan")) if len(np.unique(rx)) < 2 else _st.spearmanr(rx, ry)
+
+    # Cluster bootstrap over layers.
+    clusters = np.unique(g)
+    rng = np.random.default_rng(seed)
+    boot = []
+    idx_by_cluster = {c: np.where(g == c)[0] for c in clusters}
+    for _ in range(n_boot):
+        chosen = rng.choice(clusters, size=len(clusters), replace=True)
+        idx = np.concatenate([idx_by_cluster[c] for c in chosen])
+        gb = g[idx]
+        rxb = _residualize_within_group(x[idx], gb)
+        ryb = _residualize_within_group(y[idx], gb)
+        boot.append(_corr(rxb, ryb))
+    boot = np.array([b for b in boot if b == b])  # drop NaN
+    ci = ([float(np.quantile(boot, 0.025)), float(np.quantile(boot, 0.975))]
+          if len(boot) else [float("nan"), float("nan")])
+
+    return {
+        "partial_r": float(r), "p_value": float(p),
+        "ci_low": ci[0], "ci_high": ci[1],
+        "method": method, "n_clusters": int(len(clusters)),
+    }
+
+
+def lead_lag(
+    series_a: Sequence[float],
+    series_b: Sequence[float],
+    *,
+    max_lag: int | None = None,
+    n_perm: int = 5000,
+    seed: int = 42,
+) -> dict:
+    """
+    Cross-correlation lead-lag analysis between two training-time series (item P9).
+
+    Positive ``best_lag`` means series_a LEADS series_b (a's changes precede b's)
+    — e.g. "retrieval heads form before utility shifts". Significance via a
+    permutation test that shuffles one series.
+
+    Args:
+        series_a, series_b: Equal-length sequences (e.g. per-checkpoint
+            n_retrieval_heads and mean utility), ideally z-scored beforehand.
+        max_lag: Maximum lag to scan (default: len//2).
+
+    Returns:
+        best_lag, peak_corr, p_value, lags, corrs.
+    """
+    a = np.asarray(series_a, dtype=np.float64)
+    b = np.asarray(series_b, dtype=np.float64)
+    n = len(a)
+    if n < 4 or len(b) != n:
+        return {"best_lag": 0, "peak_corr": float("nan"), "p_value": float("nan"),
+                "lags": [], "corrs": []}
+    a = (a - a.mean()) / (a.std() + 1e-12)
+    b = (b - b.mean()) / (b.std() + 1e-12)
+    max_lag = max_lag or (n // 2)
+
+    def _xcorr(x, y):
+        lags = list(range(-max_lag, max_lag + 1))
+        cs = []
+        for lag in lags:
+            # Positive lag ⇒ x LEADS y by `lag`: align x[t] with y[t+lag].
+            if lag > 0:
+                c = np.corrcoef(x[:-lag], y[lag:])[0, 1]
+            elif lag < 0:
+                c = np.corrcoef(x[-lag:], y[:lag])[0, 1]
+            else:
+                c = np.corrcoef(x, y)[0, 1]
+            cs.append(0.0 if np.isnan(c) else c)
+        return lags, cs
+
+    lags, corrs = _xcorr(a, b)
+    peak_i = int(np.argmax(np.abs(corrs)))
+    best_lag, peak = lags[peak_i], corrs[peak_i]
+
+    rng = np.random.default_rng(seed)
+    count = 0
+    for _ in range(n_perm):
+        bp = rng.permutation(b)
+        _, cs = _xcorr(a, bp)
+        if max(np.abs(cs)) >= abs(peak):
+            count += 1
+    p = (count + 1) / (n_perm + 1)
+    return {"best_lag": int(best_lag), "peak_corr": float(peak),
+            "p_value": float(p), "lags": lags, "corrs": corrs}
+
+
+def layer_zscore(values: np.ndarray) -> np.ndarray:
+    """
+    Z-score a (n_layers, n_heads) matrix WITHIN each layer (item P3).
+
+    Removes the layer-scale effect that causes vertical banding in Figure 1.
+    Layers with zero variance map to zeros.
+    """
+    v = np.asarray(values, dtype=np.float64)
+    mean = v.mean(axis=1, keepdims=True)
+    std = v.std(axis=1, ddof=0, keepdims=True)
+    out = np.zeros_like(v)
+    nz = std[:, 0] > 0
+    out[nz] = (v[nz] - mean[nz]) / std[nz]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Set overlap (used by the quantization ablation, A2)
 # ---------------------------------------------------------------------------
 

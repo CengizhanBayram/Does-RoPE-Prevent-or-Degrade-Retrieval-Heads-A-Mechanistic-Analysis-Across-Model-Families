@@ -18,6 +18,8 @@ from src.stats_utils import (
     bootstrap_mean_diff_ci,
     clustered_permutation_test,
     cohens_d,
+    layer_zscore,
+    partial_correlation,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,17 +66,23 @@ class DimensionUtilityAnalyzer:
             self.head_dim = self.hidden_dim // self.n_heads
 
         # Pre-compute RoPE frequency order (ascending frequency).
-        # RoPE applies frequencies to *pairs* of dimensions: dim 2i and 2i+1
-        # share frequency theta^(-2i/head_dim).
+        # FIX P2: LLaMA / Qwen / OLMo all use HuggingFace's `rotate_half`
+        # (NeoX / "half-split") convention, NOT the interleaved GPT-J one.
+        # There, dimension j and dimension j + head_dim/2 form a rotated pair and
+        # SHARE the frequency theta^(-2j/head_dim) for j in [0, head_dim/2).
+        # So the per-dimension frequency vector is concatenate([freqs, freqs]),
+        # not np.repeat(freqs, 2). Using the wrong convention scrambles which
+        # dimensions count as "high frequency" and corrupts the frequency profile
+        # (Fig 2/4) and the high_freq/low_freq patching (§6).
         half = self.head_dim // 2
         freqs = np.array(
             [self.theta ** (-2 * i / self.head_dim) for i in range(half)],
             dtype=np.float64,
         )
-        # Expand: position 2i and 2i+1 share the same frequency
-        freq_per_dim = np.repeat(freqs, 2)  # length = head_dim
+        freq_per_dim = np.concatenate([freqs, freqs])  # length = head_dim (rotate_half)
+        self.freq_per_dim: np.ndarray = freq_per_dim
         # Argsort ascending → index 0 is the *lowest* frequency dimension
-        self.freq_order: np.ndarray = np.argsort(freq_per_dim)
+        self.freq_order: np.ndarray = np.argsort(freq_per_dim, kind="stable")
         self.freq_values_sorted: np.ndarray = freq_per_dim[self.freq_order]
 
     @staticmethod
@@ -281,6 +289,9 @@ class DimensionUtilityAnalyzer:
             "ci_level": ci["ci_level"],
             "clustered_permutation_p": perm["p_value"],
             "per_head_scalar": per_head_scalar.tolist(),
+            # P3: layer-wise z-scored utility removes the per-layer scale effect
+            # that causes vertical banding in Figure 1. Plot this, not the raw L1.
+            "per_head_scalar_zscore": layer_zscore(per_head_scalar).tolist(),
             "n_retrieval": len(retrieval_vals),
             "n_non_retrieval": len(non_retrieval_vals),
         }
@@ -304,34 +315,49 @@ class DimensionUtilityAnalyzer:
             norms: (n_layers, n_heads, head_dim) norm matrix.
 
         Returns:
-            Dict with keys: pearson_r, pearson_p, spearman_rho, spearman_p.
+            Dict with keys: pearson_r, pearson_p, spearman_rho, spearman_p,
+            partial_spearman_r, partial_p, partial_ci_low, partial_ci_high
+            (layer-controlled, item P4).
         """
+        n_layers, n_heads = retrieval_scores.shape
         per_head_utility = norms.mean(axis=-1).flatten()
         per_head_retrieval = retrieval_scores.flatten()
+        layer_idx = np.repeat(np.arange(n_layers), n_heads)
 
+        nan_block = {
+            "pearson_r": float("nan"), "pearson_p": float("nan"),
+            "spearman_rho": float("nan"), "spearman_p": float("nan"),
+            "partial_spearman_r": float("nan"), "partial_p": float("nan"),
+            "partial_ci_low": float("nan"), "partial_ci_high": float("nan"),
+        }
         if len(np.unique(per_head_retrieval)) < 2 or len(np.unique(per_head_utility)) < 2:
-            logger.warning(
-                "Constant array detected; correlation is undefined. Returning NaN."
-            )
-            return {
-                "pearson_r": float("nan"),
-                "pearson_p": float("nan"),
-                "spearman_rho": float("nan"),
-                "spearman_p": float("nan"),
-            }
+            logger.warning("Constant array detected; correlation undefined. Returning NaN.")
+            return nan_block
 
         pearson_r, pearson_p = stats.pearsonr(per_head_retrieval, per_head_utility)
         spearman_rho, spearman_p = stats.spearmanr(per_head_retrieval, per_head_utility)
 
+        # P4: layer-controlled partial correlation (the statistic to TRUST — the
+        # raw r is confounded because layer drives both retrieval and norm scale).
+        partial = partial_correlation(
+            per_head_retrieval, per_head_utility, layer_idx, method="spearman"
+        )
+
         logger.info(
-            "Correlation — Pearson r=%.3f (p=%.4f), Spearman ρ=%.3f (p=%.4f)",
-            pearson_r, pearson_p, spearman_rho, spearman_p,
+            "Correlation — raw Spearman ρ=%.3f (p=%.4f) | layer-PARTIAL ρ=%.3f "
+            "(p=%.4f, 95%% CI [%.3f, %.3f])",
+            spearman_rho, spearman_p, partial["partial_r"], partial["p_value"],
+            partial["ci_low"], partial["ci_high"],
         )
         return {
             "pearson_r": float(pearson_r),
             "pearson_p": float(pearson_p),
             "spearman_rho": float(spearman_rho),
             "spearman_p": float(spearman_p),
+            "partial_spearman_r": partial["partial_r"],
+            "partial_p": partial["p_value"],
+            "partial_ci_low": partial["ci_low"],
+            "partial_ci_high": partial["ci_high"],
         }
 
     # ------------------------------------------------------------------

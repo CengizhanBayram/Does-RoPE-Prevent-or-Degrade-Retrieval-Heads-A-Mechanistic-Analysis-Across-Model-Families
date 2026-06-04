@@ -75,7 +75,13 @@ def plot_retrieval_vs_utility_scatter(
 
     for model_name, res in results.items():
         scores = np.array(res["retrieval_scores"])
-        utility = np.array(res["dimension_utility"]["per_head_scalar"])
+        # P3: prefer the layer-wise z-scored utility (removes the per-layer scale
+        # effect that causes vertical banding); fall back to raw L1 if absent.
+        du = res["dimension_utility"]
+        if du.get("per_head_scalar_zscore") is not None:
+            utility = np.array(du["per_head_scalar_zscore"])
+        else:
+            utility = np.array(du["per_head_scalar"])
         retrieval_set = {(r[0], r[1]) for r in res["retrieval_heads"]}
 
         n_layers, n_heads = scores.shape
@@ -124,8 +130,24 @@ def plot_retrieval_vs_utility_scatter(
     if last_sc is not None:
         plt.colorbar(last_sc, ax=ax, label="Layer depth")
 
+    # P4: annotate the layer-controlled partial correlation (the trustworthy
+    # statistic) when available, since the raw OLS r is layer-confounded.
+    partials = [res["statistical_tests"].get("partial_spearman_r")
+                for res in results.values()
+                if res.get("statistical_tests", {}).get("partial_spearman_r") is not None]
+    if partials:
+        ax.text(
+            0.98, 0.02,
+            "layer-partial ρ: " + ", ".join(
+                f"{m}={res['statistical_tests']['partial_spearman_r']:.3f}"
+                for m, res in results.items()
+                if res.get("statistical_tests", {}).get("partial_spearman_r") is not None),
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=7,
+            bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow", ec="gray"),
+        )
+
     ax.set_xlabel("Retrieval score (NIAH hit rate)", fontsize=12)
-    ax.set_ylabel("Mean dimension utility (L1 norm)", fontsize=12)
+    ax.set_ylabel("Dimension utility (layer-wise z-score)", fontsize=12)
     ax.set_title("Figure 1 — Retrieval Score vs. Dimension Utility", fontsize=13)
     ax.legend(fontsize=9)
     _save(fig, save_path, dpi=dpi)
@@ -205,7 +227,20 @@ def plot_olmo_training_dynamics(
         save_path: Output file path.
         dpi: Output resolution.
     """
-    steps = [r["step"] for r in checkpoint_results]
+    import re
+
+    # P14: x-axis is tokens SEEN (B), parsed from the revision string
+    # ("stage1-step40000-tokens168B"); fall back to step if unavailable.
+    def _tokens_b(r):
+        m = re.search(r"tokens(\d+)B", r.get("revision", ""))
+        return int(m.group(1)) if m else None
+
+    tokens = [_tokens_b(r) for r in checkpoint_results]
+    if all(t is not None for t in tokens):
+        x_vals, x_label = tokens, "Tokens seen (B)"
+    else:
+        x_vals, x_label = [r["step"] for r in checkpoint_results], "Training step"
+    steps = x_vals  # kept for the crystallization annotation below
     n_heads_list = [r["summary"]["n_retrieval_heads"] for r in checkpoint_results]
 
     top20_utility = []
@@ -213,6 +248,18 @@ def plot_olmo_training_dynamics(
         scalar_grid = np.array(r["dimension_utility"]["per_head_scalar"]).flatten()
         top20 = np.sort(scalar_grid)[-20:]
         top20_utility.append(float(top20.mean()))
+
+    # P9: lead-lag — do retrieval-head changes PRECEDE utility changes?
+    lead_lag_note = ""
+    if len(n_heads_list) >= 4:
+        from src.stats_utils import lead_lag
+        ll = lead_lag(n_heads_list, top20_utility)
+        if ll["best_lag"] == ll["best_lag"]:  # not NaN
+            rel = ("heads LEAD utility" if ll["best_lag"] > 0
+                   else "utility LEADS heads" if ll["best_lag"] < 0
+                   else "synchronous")
+            lead_lag_note = (f"lead-lag={ll['best_lag']:+d} ({rel}), "
+                             f"peak r={ll['peak_corr']:.2f}, p={ll['p_value']:.3f}")
 
     fig, ax1 = plt.subplots(figsize=(10, 5))
     ax2 = ax1.twinx()
@@ -239,14 +286,14 @@ def plot_olmo_training_dynamics(
         util_at_cryst = top20_utility[cryst_idx]
         util_before = top20_utility[max(0, cryst_idx - 1)]
         direction = "decreasing" if util_at_cryst < util_before else "increasing/stable"
-        ax1.set_title(
-            f"Figure 3 — OLMo-2 Training Dynamics\nUtility at crystallization: {direction}",
-            fontsize=12,
-        )
+        subtitle = f"Utility at crystallization: {direction}"
+        if lead_lag_note:
+            subtitle += f"  |  {lead_lag_note}"
+        ax1.set_title(f"Figure 3 — OLMo-2 Training Dynamics\n{subtitle}", fontsize=11)
     else:
         ax1.set_title("Figure 3 — OLMo-2 Training Dynamics", fontsize=12)
 
-    ax1.set_xlabel("Training step", fontsize=11)
+    ax1.set_xlabel(x_label, fontsize=11)
     ax1.set_ylabel("# Retrieval heads", color=color_ret, fontsize=11)
     ax2.set_ylabel("Top-20 mean dimension utility", color=color_util, fontsize=11)
     ax1.tick_params(axis="y", labelcolor=color_ret)

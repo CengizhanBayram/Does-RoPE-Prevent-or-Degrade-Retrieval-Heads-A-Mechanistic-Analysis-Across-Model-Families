@@ -10,7 +10,45 @@ from src.stats_utils import (
     clustered_permutation_test,
     cohens_d,
     jaccard,
+    layer_zscore,
+    lead_lag,
+    partial_correlation,
 )
+
+
+def test_partial_correlation_removes_layer_confound():
+    # Construct a pure layer confound: within each layer x and y are unrelated,
+    # but layer means rise together → raw corr is high, partial corr ~0.
+    rng = np.random.default_rng(0)
+    x, y, layer = [], [], []
+    for L in range(8):
+        base = L * 10.0  # shared layer effect drives both up
+        for _ in range(12):
+            x.append(base + rng.normal(0, 1))
+            y.append(base + rng.normal(0, 1))
+            layer.append(L)
+    raw = abs(np.corrcoef(x, y)[0, 1])
+    res = partial_correlation(x, y, layer, method="pearson", n_boot=500)
+    assert raw > 0.8                       # raw correlation inflated by layer
+    assert abs(res["partial_r"]) < 0.3     # partial removes the confound
+    assert res["n_clusters"] == 8
+
+
+def test_layer_zscore_zero_mean_unit_var_per_layer():
+    v = np.array([[1.0, 2.0, 3.0], [10.0, 20.0, 30.0]])
+    z = layer_zscore(v)
+    assert np.allclose(z.mean(axis=1), 0.0, atol=1e-9)
+    assert np.allclose(z.std(axis=1), 1.0, atol=1e-9)
+
+
+def test_lead_lag_detects_shift():
+    # b is a lagged copy of a (b[t] = a[t-2]) → a leads b by +2.
+    rng = np.random.default_rng(1)
+    a = rng.normal(0, 1, size=30)
+    b = np.concatenate([[0, 0], a[:-2]])
+    res = lead_lag(a, b, n_perm=1000)
+    assert res["best_lag"] == 2
+    assert res["p_value"] < 0.05
 
 
 def test_jaccard_identical_sets():
