@@ -31,7 +31,7 @@ import yaml
 # Allow running from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.dimension_utility import DimensionUtilityAnalyzer
+from src.dimension_utility import DimensionUtilityAnalyzer, diagnose_dimension_norms
 from src.model_loader import load_model as _load_model_shared
 from src.repro import capture_environment, set_determinism
 from src.retrieval_head_detector import (
@@ -224,6 +224,11 @@ def run_analysis(
             "per_head_scalar": utility_stats["per_head_scalar"],
             "per_head_scalar_zscore": utility_stats.get("per_head_scalar_zscore"),
             "frequency_profile": freq_profile,
+            # Figure-2 spike diagnostic: is the low-norm dim genuine or artifact?
+            "raw_dim_diagnostic": diagnose_dimension_norms(
+                norms, analyzer.head_dim, n_heads=analyzer.n_heads,
+                n_kv_heads=getattr(model.config, "num_key_value_heads", analyzer.n_heads),
+            ),
         },
         "statistical_tests": stat_tests,
         "summary": {

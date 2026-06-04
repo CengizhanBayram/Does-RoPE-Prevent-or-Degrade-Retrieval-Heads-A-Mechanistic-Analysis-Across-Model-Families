@@ -25,6 +25,69 @@ from src.stats_utils import (
 logger = logging.getLogger(__name__)
 
 
+def diagnose_dimension_norms(
+    norms: np.ndarray,
+    head_dim: int,
+    n_heads: int | None = None,
+    n_kv_heads: int | None = None,
+) -> dict:
+    """
+    Diagnose the Figure-2 'spike': is a low-norm RoPE dimension GENUINE or an
+    artifact? (Closes the gap "why would a dead dim be GQA-specific?".)
+
+    Measures the RAW (unsorted) per-dimension mean q_proj L1 norm and reports:
+      - which raw dim is the minimum and its value,
+      - its ratio to the median (a genuine near-dead dim ⇒ small ratio),
+      - whether it sits on a structural boundary (rotate_half split head_dim/2,
+        or a GQA kv-group boundary) — boundary coincidence ⇒ suspect artifact.
+
+    Args:
+        norms: (n_layers, n_heads, head_dim) L1-norm matrix.
+        head_dim: per-head dimension.
+
+    Returns:
+        Dict with per_dim_mean_norm, median_norm, min_dim, min_norm,
+        min_ratio_to_median, head_dim_half, min_at_rotate_half_boundary,
+        kv_group_boundaries, min_at_kv_boundary, verdict.
+    """
+    per_dim = np.asarray(norms, dtype=np.float64).reshape(-1, head_dim).mean(axis=0)
+    median = float(np.median(per_dim))
+    min_dim = int(np.argmin(per_dim))
+    min_norm = float(per_dim[min_dim])
+    ratio = float(min_norm / median) if median > 0 else float("nan")
+
+    half = head_dim // 2
+    at_half = min_dim in (half - 1, half)
+
+    kv_boundaries: list[int] = []
+    if n_heads and n_kv_heads and n_kv_heads < n_heads:
+        # kv-group boundaries within a head are not standard, but check the
+        # head_dim/group split points just in case the artifact tracks them.
+        group = head_dim // (n_heads // n_kv_heads) if (n_heads // n_kv_heads) else head_dim
+        kv_boundaries = [group * k for k in range(1, head_dim // max(1, group))]
+    at_kv = any(abs(min_dim - b) <= 1 for b in kv_boundaries)
+
+    if at_half or at_kv:
+        verdict = "SUSPECT-ARTIFACT (min-norm dim sits on a structural boundary)"
+    elif ratio < 0.2:
+        verdict = "GENUINE low-norm dimension (raw norm << median, off-boundary)"
+    else:
+        verdict = "no strong dip (min norm comparable to median)"
+
+    return {
+        "per_dim_mean_norm": per_dim.tolist(),
+        "median_norm": median,
+        "min_dim": min_dim,
+        "min_norm": min_norm,
+        "min_ratio_to_median": ratio,
+        "head_dim_half": half,
+        "min_at_rotate_half_boundary": bool(at_half),
+        "kv_group_boundaries": kv_boundaries,
+        "min_at_kv_boundary": bool(at_kv),
+        "verdict": verdict,
+    }
+
+
 class DimensionUtilityAnalyzer:
     """
     Measures per-dimension utility of Q projections across all attention heads.
