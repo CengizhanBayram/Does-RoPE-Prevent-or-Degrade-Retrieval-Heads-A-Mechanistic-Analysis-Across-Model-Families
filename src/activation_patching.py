@@ -10,8 +10,12 @@ are actually load-bearing for retrieval behaviour.
 from __future__ import annotations
 
 import gc
+import json
 import logging
+import os
 import random
+import re
+import tempfile
 from contextlib import contextmanager
 from typing import Any, Generator
 
@@ -236,6 +240,7 @@ class ActivationPatcher:
         n_samples: int = 50,
         random_seeds: list[int] | None = None,
         freq_order: "np.ndarray | None" = None,
+        checkpoint_path: str | None = None,
     ) -> dict:
         """
         Run multi-condition activation patching for each retrieval head.
@@ -267,6 +272,13 @@ class ActivationPatcher:
             freq_order: Per-head dimension indices sorted by ASCENDING RoPE
                 frequency (``DimensionUtilityAnalyzer.freq_order``). When None,
                 the frequency conditions are skipped.
+            checkpoint_path: Optional JSON path. When given, the baseline and
+                each head's result are written incrementally (atomically) after
+                every head, and an existing file is loaded on start so already
+                completed heads are skipped. This makes a long run resumable
+                across interrupted sessions WITHOUT changing any computed value
+                (identical heads, conditions, and seeds). When None, behaviour is
+                exactly as before (single in-memory pass, no persistence).
 
         Returns:
             Dict keyed by (layer, head) tuples with per-condition accuracies.
@@ -289,14 +301,35 @@ class ActivationPatcher:
 
         norms_matrix: np.ndarray | None = utility_scores.get("_norms")
 
-        # FIX #11: Compute baseline ONCE outside the head loop.
-        logger.info("Computing baseline accuracy (no patch) …")
-        baseline_acc = self._evaluate_accuracy(eval_samples)
-        logger.info("Baseline accuracy: %.3f", baseline_acc)
-
+        # Resume from checkpoint if one exists (skips already-computed heads and
+        # reuses the saved baseline). Computed values are unchanged.
         results: dict = {}
+        baseline_acc: float | None = None
+        if checkpoint_path is not None:
+            loaded = _load_checkpoint(checkpoint_path)
+            if loaded is not None:
+                baseline_acc = loaded.get("baseline")
+                for key, entry in loaded.get("heads", {}).items():
+                    lh = _parse_head_key(key)
+                    if lh is not None:
+                        results[lh] = entry
+                if results:
+                    logger.info(
+                        "Resuming from checkpoint %s: %d head(s) already done.",
+                        checkpoint_path, len(results),
+                    )
+
+        # FIX #11: Compute baseline ONCE outside the head loop.
+        if baseline_acc is None:
+            logger.info("Computing baseline accuracy (no patch) …")
+            baseline_acc = self._evaluate_accuracy(eval_samples)
+            logger.info("Baseline accuracy: %.3f", baseline_acc)
+            if checkpoint_path is not None:
+                _save_checkpoint(checkpoint_path, baseline_acc, results)
 
         for (layer_idx, head_idx) in retrieval_heads:
+            if (layer_idx, head_idx) in results:
+                continue  # already computed in a previous session (resume)
             logger.info("Patching experiment: layer=%d head=%d", layer_idx, head_idx)
 
             if norms_matrix is not None:
@@ -371,6 +404,8 @@ class ActivationPatcher:
                 )
 
             results[(layer_idx, head_idx)] = entry
+            if checkpoint_path is not None:
+                _save_checkpoint(checkpoint_path, baseline_acc, results)
 
         return results
 
@@ -464,3 +499,54 @@ class ActivationPatcher:
 def _null_context() -> Generator[None, None, None]:
     """No-op context manager used when no patch is applied."""
     yield
+
+
+# ---------------------------------------------------------------------------
+# Helpers: resumable checkpointing for run_patching_experiment
+# ---------------------------------------------------------------------------
+
+_HEAD_KEY_RE = re.compile(r"layer(\d+)_head(\d+)")
+
+
+def _parse_head_key(key: str) -> tuple[int, int] | None:
+    """Parse a 'layer{L}_head{H}' checkpoint key back into an (L, H) tuple."""
+    m = _HEAD_KEY_RE.fullmatch(key)
+    if m is None:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _load_checkpoint(path: str) -> dict | None:
+    """Load a patching checkpoint, or None if missing/corrupt (start fresh)."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Checkpoint %s unreadable (%s); starting fresh.", path, exc)
+        return None
+
+
+def _save_checkpoint(path: str, baseline: float, results: dict) -> None:
+    """Atomically write {baseline, heads} so an interrupt cannot corrupt it.
+
+    Writes to a temp file in the same directory and renames over the target,
+    which is atomic on a given filesystem (so a disconnect mid-write leaves the
+    previous good checkpoint intact).
+    """
+    payload = {
+        "baseline": baseline,
+        "heads": {f"layer{l}_head{h}": v for (l, h), v in results.items()},
+    }
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
