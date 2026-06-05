@@ -193,7 +193,10 @@ def test_run_population_patching_is_per_condition_not_per_head():
 
     def fake_pop(samples, head_dims=None, mode="qk"):
         calls["n"] += 1
-        return 1.0 if head_dims is None else 0.7
+        # returns (accuracy, per_sample) now; patched conditions miss one sample
+        if head_dims is None:
+            return 1.0, [1, 1, 1, 1]
+        return 0.75, [1, 0, 1, 1]
 
     # monkeypatch via setattr (no pytest fixture needed here)
     patcher._evaluate_population = fake_pop
@@ -206,3 +209,13 @@ def test_run_population_patching_is_per_condition_not_per_head():
     assert out["n_heads"] == 3
     assert out["baseline"] == 1.0
     assert "frequency_effect" in out and "causal_effect" in out
+    assert "frequency_mcnemar" in out and "frequency_effect_ci95" in out
+
+
+def test_mcnemar_exact_basic():
+    from src.activation_patching import _mcnemar_exact
+    assert _mcnemar_exact(0, 0) == 1.0          # no discordant pairs
+    assert _mcnemar_exact(5, 5) == 1.0          # symmetric -> not significant
+    assert _mcnemar_exact(12, 0) < 0.001        # all discordance one way -> tiny p
+    # monotone: more one-sided discordance => smaller p
+    assert _mcnemar_exact(10, 0) < _mcnemar_exact(6, 2)

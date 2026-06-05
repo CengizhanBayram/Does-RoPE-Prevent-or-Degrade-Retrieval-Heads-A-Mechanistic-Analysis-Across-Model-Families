@@ -297,14 +297,20 @@ class ActivationPatcher:
         samples: list[dict],
         head_dims: "dict[tuple[int, int], list[int]] | None" = None,
         mode: str = "qk",
-    ) -> float:
-        """NIAH accuracy with MANY heads patched simultaneously (or none)."""
+    ) -> "tuple[float, list[int]]":
+        """NIAH accuracy with MANY heads patched simultaneously (or none).
+
+        Returns ``(accuracy, per_sample)`` where ``per_sample[i]`` is 1/0 for
+        sample i. OOM is counted as 0 (not skipped) so that conditions evaluated
+        on the same sample list stay paired/aligned for a McNemar test.
+        """
         device = next(
             (p for p in self.model.parameters() if p.device.type != "meta"),
             next(self.model.parameters()),
         ).device
-        correct = total = 0
+        per_sample: list[int] = []
         for sample in samples:
+            ok = 0
             input_ids = torch.tensor(
                 [sample["prompt_ids"]], dtype=torch.long, device=device
             )
@@ -317,12 +323,10 @@ class ActivationPatcher:
                 gen = self.tokenizer.decode(
                     out[0, input_ids.shape[1]:], skip_special_tokens=True
                 )
-                if sample["code"] in gen:
-                    correct += 1
-                total += 1
+                ok = 1 if sample["code"] in gen else 0
             except RuntimeError as exc:
                 if "out of memory" in str(exc).lower():
-                    logger.warning("OOM during population eval; skipping sample.")
+                    logger.warning("OOM during population eval; counting as incorrect.")
                     gc.collect(); torch.cuda.empty_cache()
                 else:
                     raise
@@ -332,7 +336,9 @@ class ActivationPatcher:
                 if "out" in locals():
                     del out
                 torch.cuda.empty_cache()
-        return correct / total if total > 0 else 0.0
+            per_sample.append(ok)
+        acc = float(np.mean(per_sample)) if per_sample else 0.0
+        return acc, per_sample
 
     # ------------------------------------------------------------------
     # Full experiment
@@ -562,12 +568,16 @@ class ActivationPatcher:
             low_map[(layer_idx, head_idx)] = order[:k].tolist()
             high_map[(layer_idx, head_idx)] = order[-k:].tolist()
 
+        base_acc, _ = self._evaluate_population(eval_samples, None)
+        low_acc, _ = self._evaluate_population(eval_samples, low_map)
+        high_acc, _ = self._evaluate_population(eval_samples, high_map)
         out: dict = {
             "n_heads": len(retrieval_heads),
             "k_dims": k,
-            "baseline": self._evaluate_population(eval_samples, None),
-            "low_utility": self._evaluate_population(eval_samples, low_map),
-            "high_utility": self._evaluate_population(eval_samples, high_map),
+            "n_samples": len(eval_samples),
+            "baseline": base_acc,
+            "low_utility": low_acc,
+            "high_utility": high_acc,
         }
         rand_accs = []
         for seed in seeds:
@@ -576,7 +586,8 @@ class ActivationPatcher:
                 lh: rng.choice(head_dim, size=k, replace=False).tolist()
                 for lh in retrieval_heads
             }
-            rand_accs.append(self._evaluate_population(eval_samples, rmap))
+            acc, _ = self._evaluate_population(eval_samples, rmap)
+            rand_accs.append(acc)
         out["random"] = float(np.mean(rand_accs))
         out["causal_effect"] = out["random"] - out["low_utility"]
         logger.info(
@@ -589,16 +600,41 @@ class ActivationPatcher:
             fo = np.asarray(freq_order).astype(int)
             low_freq = fo[:k].tolist()
             high_freq = fo[-k:].tolist()
-            out["low_freq"] = self._evaluate_population(
+            lf_acc, lf_v = self._evaluate_population(
                 eval_samples, {lh: low_freq for lh in retrieval_heads}
             )
-            out["high_freq"] = self._evaluate_population(
+            hf_acc, hf_v = self._evaluate_population(
                 eval_samples, {lh: high_freq for lh in retrieval_heads}
             )
-            out["frequency_effect"] = out["low_freq"] - out["high_freq"]
+            out["low_freq"] = lf_acc
+            out["high_freq"] = hf_acc
+            out["frequency_effect"] = lf_acc - hf_acc
+
+            # Paired significance: low_freq vs high_freq on the SAME samples.
+            lf = np.asarray(lf_v); hf = np.asarray(hf_v)
+            b = int(np.sum((lf == 0) & (hf == 1)))   # low_freq wrong, high_freq right
+            c = int(np.sum((lf == 1) & (hf == 0)))   # low_freq right, high_freq wrong
+            out["frequency_mcnemar"] = {
+                "b_lowfreq_worse": b, "c_lowfreq_better": c,
+                "n_discordant": b + c, "p_value": _mcnemar_exact(b, c),
+            }
+            # Bootstrap 95% CI on the paired accuracy difference (low_freq - high_freq).
+            n = len(lf)
+            if n > 0:
+                rng = np.random.default_rng(0)
+                diffs = [
+                    float(lf[idx].mean() - hf[idx].mean())
+                    for idx in (rng.integers(0, n, n) for _ in range(10000))
+                ]
+                out["frequency_effect_ci95"] = [
+                    float(np.quantile(diffs, 0.025)),
+                    float(np.quantile(diffs, 0.975)),
+                ]
             logger.info(
-                "Population freq: low_freq=%.3f high_freq=%.3f freq_effect=%.4f",
-                out["low_freq"], out["high_freq"], out["frequency_effect"],
+                "Population freq: low_freq=%.3f high_freq=%.3f freq_effect=%.4f "
+                "McNemar p=%.4g",
+                lf_acc, hf_acc, out["frequency_effect"],
+                out["frequency_mcnemar"]["p_value"],
             )
         return out
 
@@ -697,6 +733,22 @@ def _null_context() -> Generator[None, None, None]:
 # ---------------------------------------------------------------------------
 # Helpers: resumable checkpointing for run_patching_experiment
 # ---------------------------------------------------------------------------
+
+def _mcnemar_exact(b: int, c: int) -> float:
+    """Two-sided exact McNemar (binomial) p-value for discordant counts b, c.
+
+    b and c are the two kinds of discordant pairs; concordant pairs are
+    irrelevant. Returns 1.0 when there are no discordant pairs.
+    """
+    from math import comb
+
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    tail = sum(comb(n, i) for i in range(k + 1)) * (0.5 ** n)
+    return float(min(1.0, 2.0 * tail))
+
 
 _HEAD_KEY_RE = re.compile(r"layer(\d+)_head(\d+)")
 
