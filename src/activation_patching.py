@@ -340,6 +340,48 @@ class ActivationPatcher:
         acc = float(np.mean(per_sample)) if per_sample else 0.0
         return acc, per_sample
 
+    @torch.no_grad()
+    def _evaluate_perplexity(
+        self,
+        texts: list[str],
+        head_dims: "dict[tuple[int, int], list[int]] | None" = None,
+        mode: str = "qk",
+        max_len: int = 4096,
+    ) -> float:
+        """Mean token-level perplexity over plain texts, optionally patched.
+
+        Task-specificity control: if a patch that breaks NIAH leaves perplexity
+        on ordinary text ~unchanged, the effect is retrieval-specific rather than
+        a general language-modelling degradation. ``max_len`` defaults to 4096 so
+        the control is measured at the SAME long context as NIAH (low-frequency
+        dimensions only carry signal over long range; a short-context perplexity
+        control would be unfair).
+        """
+        device = next(
+            (p for p in self.model.parameters() if p.device.type != "meta"),
+            next(self.model.parameters()),
+        ).device
+        total_nll = 0.0
+        total_tok = 0
+        for text in texts:
+            enc = self.tokenizer(
+                text, return_tensors="pt", truncation=True, max_length=max_len
+            )
+            ids = enc["input_ids"].to(device)
+            if ids.shape[1] < 2:
+                continue
+            ctx = self.patch_heads(head_dims, mode) if head_dims else _null_context()
+            with ctx:
+                out = self.model(ids, labels=ids)
+            n = ids.shape[1] - 1               # next-token targets
+            total_nll += float(out.loss) * n   # loss is mean NLL over the n targets
+            total_tok += n
+            del ids, out
+            torch.cuda.empty_cache()
+        if total_tok == 0:
+            return float("nan")
+        return float(np.exp(total_nll / total_tok))
+
     # ------------------------------------------------------------------
     # Full experiment
     # ------------------------------------------------------------------
@@ -535,6 +577,9 @@ class ActivationPatcher:
         n_samples: int = 50,
         random_seeds: list[int] | None = None,
         freq_order: "np.ndarray | None" = None,
+        control_heads: "list[tuple[int, int]] | None" = None,
+        perplexity_texts: "list[str] | None" = None,
+        perplexity_max_len: int = 4096,
     ) -> dict:
         """Patch ALL given heads simultaneously, per condition (breaks ceiling).
 
@@ -546,7 +591,18 @@ class ActivationPatcher:
 
         Returns a flat dict: n_heads, baseline, low_utility, random,
         high_utility, causal_effect, and (when ``freq_order`` is given) low_freq,
-        high_freq, frequency_effect — each a single population accuracy.
+        high_freq, frequency_effect — each a single population accuracy, plus a
+        paired McNemar test and bootstrap CI for low_freq vs high_freq.
+
+        Specificity controls (optional):
+          - ``control_heads``: matched NON-retrieval heads. Adds
+            ``low_freq_control_heads`` and ``retrieval_head_specificity`` (the
+            control-minus-retrieval accuracy gap); a large positive gap means
+            the effect is retrieval-head specific.
+          - ``perplexity_texts``: plain (non-NIAH) passages. Adds
+            ``perplexity_baseline``/``perplexity_lowfreq``/``perplexity_ratio``;
+            a ratio near 1.0 means the low-freq patch does not harm general LM
+            ability, so the NIAH drop is task-specific.
         """
         k = k_dims or self.k_dims
         seeds = random_seeds or list(range(5))
@@ -636,6 +692,58 @@ class ActivationPatcher:
                 lf_acc, hf_acc, out["frequency_effect"],
                 out["frequency_mcnemar"]["p_value"],
             )
+
+            # Specificity control 1 (HEAD): zero the low-freq dims in matched
+            # NON-retrieval heads. If recall stays high, the effect is specific
+            # to retrieval heads, not a generic consequence of zeroing low-freq.
+            if control_heads:
+                lf_ctrl, _ = self._evaluate_population(
+                    eval_samples, {lh: low_freq for lh in control_heads}
+                )
+                out["low_freq_control_heads"] = lf_ctrl
+                out["retrieval_head_specificity"] = lf_ctrl - lf_acc
+                logger.info(
+                    "Control (low_freq in %d non-retrieval heads): %.3f "
+                    "(retrieval heads: %.3f)", len(control_heads), lf_ctrl, lf_acc,
+                )
+
+            # Specificity control 2 (TASK): perplexity on plain text under the
+            # low-freq patch. If perplexity is ~unchanged, the NIAH drop is
+            # retrieval-specific, not a general LM degradation.
+            if perplexity_texts:
+                ppl_base = self._evaluate_perplexity(
+                    perplexity_texts, None, max_len=perplexity_max_len
+                )
+                ppl_low = self._evaluate_perplexity(
+                    perplexity_texts, {lh: low_freq for lh in retrieval_heads},
+                    max_len=perplexity_max_len,
+                )
+                out["perplexity_baseline"] = ppl_base
+                out["perplexity_lowfreq"] = ppl_low
+                out["perplexity_ratio"] = (ppl_low / ppl_base) if ppl_base else float("nan")
+                # Pre-registered specificity rule (set BEFORE seeing results):
+                # compare the RELATIVE perplexity increase to the RELATIVE NIAH
+                # drop. If perplexity barely moves while NIAH collapses, the
+                # effect is retrieval-specific; if both move proportionally, it
+                # is a general long-context degradation.
+                niah_drop = ((out["baseline"] - lf_acc) / out["baseline"]
+                             if out["baseline"] else float("nan"))
+                ppl_inc = (ppl_low - ppl_base) / ppl_base if ppl_base else float("nan")
+                out["niah_rel_drop"] = niah_drop
+                out["perplexity_rel_increase"] = ppl_inc
+                ratio = (ppl_inc / niah_drop) if niah_drop else float("nan")
+                out["specificity_ratio"] = ratio
+                out["specificity_verdict"] = (
+                    "retrieval-specific" if ratio < 0.33
+                    else "general-long-context-degradation" if ratio > 0.67
+                    else "ambiguous"
+                )
+                logger.info(
+                    "Perplexity @%d: base=%.3f low_freq=%.3f (rel +%.1f%%) vs NIAH "
+                    "drop %.1f%% -> ratio=%.2f (%s)",
+                    perplexity_max_len, ppl_base, ppl_low, 100 * ppl_inc,
+                    100 * niah_drop, ratio, out["specificity_verdict"],
+                )
         return out
 
     # ------------------------------------------------------------------

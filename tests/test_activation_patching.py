@@ -212,6 +212,39 @@ def test_run_population_patching_is_per_condition_not_per_head():
     assert "frequency_mcnemar" in out and "frequency_effect_ci95" in out
 
 
+def test_run_population_patching_specificity_controls():
+    import numpy as np
+    patcher = _make_patcher()
+    heads = [(0, 0), (0, 1), (1, 2)]
+    control = [(2, 0), (2, 1), (3, 0)]
+    norms = np.random.RandomState(0).rand(4, 3, 8)
+    us = {"_norms": norms}
+    samples = [{"prompt_ids": [1, 2, 3], "code": "x"}] * 4
+
+    def fake_pop(samples, head_dims=None, mode="qk"):
+        return (1.0, [1, 1, 1, 1]) if head_dims is None else (0.75, [1, 0, 1, 1])
+
+    ppl = {"n": 0}
+
+    def fake_ppl(texts, head_dims=None, mode="qk", max_len=2048):
+        ppl["n"] += 1
+        return 10.0 if head_dims is None else 10.5
+
+    patcher._evaluate_population = fake_pop
+    patcher._evaluate_perplexity = fake_ppl
+    out = patcher.run_population_patching(
+        heads, us, samples, k_dims=2, n_samples=4, random_seeds=[0],
+        freq_order=np.arange(8), control_heads=control,
+        perplexity_texts=["hello world", "foo bar baz"])
+
+    # HEAD-specificity control present
+    assert "low_freq_control_heads" in out and "retrieval_head_specificity" in out
+    # TASK-specificity (perplexity) control present, baseline + low_freq = 2 calls
+    assert ppl["n"] == 2
+    assert out["perplexity_baseline"] == 10.0 and out["perplexity_lowfreq"] == 10.5
+    assert abs(out["perplexity_ratio"] - 1.05) < 1e-9
+
+
 def test_mcnemar_exact_basic():
     from src.activation_patching import _mcnemar_exact
     assert _mcnemar_exact(0, 0) == 1.0          # no discordant pairs
