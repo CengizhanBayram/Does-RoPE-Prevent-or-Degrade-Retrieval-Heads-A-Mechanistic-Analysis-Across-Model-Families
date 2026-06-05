@@ -120,6 +120,64 @@ class ActivationPatcher:
             for h in hooks:
                 h.remove()
 
+    @contextmanager
+    def patch_heads(
+        self,
+        head_dims: "dict[tuple[int, int], list[int]]",
+        mode: str = "qk",
+    ) -> Generator[None, None, None]:
+        """Zero per-head dims for MANY heads at once (population-level patch).
+
+        Args:
+            head_dims: maps (layer, head) -> per-head dim indices to zero.
+            mode: "q", "k", or "qk".
+
+        Heads in the same layer share one q_proj/k_proj, so a hook is registered
+        ONCE per layer and zeroes all that layer's requested (head, dim) columns.
+        GQA: a query head maps to KV head (head // group_size) for k_proj.
+        """
+        head_dim = self._get_head_dim()
+        n_heads, n_kv_heads = self._get_n_heads_kv()
+        group_size = max(1, n_heads // max(1, n_kv_heads))
+
+        by_layer: dict[int, list[tuple[int, list[int]]]] = {}
+        for (layer_idx, head_idx), dims in head_dims.items():
+            by_layer.setdefault(layer_idx, []).append((head_idx, dims))
+
+        def _cols(entries: list, is_kv: bool) -> list[int]:
+            cols: set[int] = set()
+            for head_idx, dims in entries:
+                base = (head_idx // group_size if is_kv else head_idx) * head_dim
+                for d in dims:
+                    if 0 <= d < head_dim:
+                        cols.add(base + d)
+            return sorted(cols)
+
+        def _make_hook(cols: list[int]):
+            def hook(module, input_: Any, output: Tensor) -> Tensor:
+                out = output.clone()
+                width = out.shape[-1]
+                for c in cols:
+                    if c < width:
+                        out[:, :, c] = 0.0
+                return out
+            return hook
+
+        hooks = []
+        try:
+            for layer_idx, entries in by_layer.items():
+                layer = self.model.model.layers[layer_idx]
+                if "q" in mode:
+                    hooks.append(layer.self_attn.q_proj.register_forward_hook(
+                        _make_hook(_cols(entries, is_kv=False))))
+                if "k" in mode:
+                    hooks.append(layer.self_attn.k_proj.register_forward_hook(
+                        _make_hook(_cols(entries, is_kv=True))))
+            yield
+        finally:
+            for h in hooks:
+                h.remove()
+
     def _get_n_heads_kv(self) -> tuple[int, int]:
         """Return (num_attention_heads, num_key_value_heads). MHA → kv == heads."""
         cfg = getattr(self.model, "config", None)
@@ -231,6 +289,49 @@ class ActivationPatcher:
                     del out
                 torch.cuda.empty_cache()
 
+        return correct / total if total > 0 else 0.0
+
+    @torch.no_grad()
+    def _evaluate_population(
+        self,
+        samples: list[dict],
+        head_dims: "dict[tuple[int, int], list[int]] | None" = None,
+        mode: str = "qk",
+    ) -> float:
+        """NIAH accuracy with MANY heads patched simultaneously (or none)."""
+        device = next(
+            (p for p in self.model.parameters() if p.device.type != "meta"),
+            next(self.model.parameters()),
+        ).device
+        correct = total = 0
+        for sample in samples:
+            input_ids = torch.tensor(
+                [sample["prompt_ids"]], dtype=torch.long, device=device
+            )
+            try:
+                ctx = self.patch_heads(head_dims, mode) if head_dims else _null_context()
+                with ctx:
+                    out = self.model.generate(
+                        input_ids, max_new_tokens=20, do_sample=False
+                    )
+                gen = self.tokenizer.decode(
+                    out[0, input_ids.shape[1]:], skip_special_tokens=True
+                )
+                if sample["code"] in gen:
+                    correct += 1
+                total += 1
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower():
+                    logger.warning("OOM during population eval; skipping sample.")
+                    gc.collect(); torch.cuda.empty_cache()
+                else:
+                    raise
+            finally:
+                if "input_ids" in locals():
+                    del input_ids
+                if "out" in locals():
+                    del out
+                torch.cuda.empty_cache()
         return correct / total if total > 0 else 0.0
 
     # ------------------------------------------------------------------
@@ -418,6 +519,88 @@ class ActivationPatcher:
                 _save_checkpoint(checkpoint_path, baseline_acc, results)
 
         return results
+
+    def run_population_patching(
+        self,
+        retrieval_heads: list[tuple[int, int]],
+        utility_scores: dict,
+        samples: list[dict],
+        k_dims: int | None = None,
+        n_samples: int = 50,
+        random_seeds: list[int] | None = None,
+        freq_order: "np.ndarray | None" = None,
+    ) -> dict:
+        """Patch ALL given heads simultaneously, per condition (breaks ceiling).
+
+        When per-head zeroing leaves NIAH at ceiling (a single head has too
+        little leverage), this asks the population question: does zeroing a
+        dimension *class* across ALL retrieval heads at once degrade recall?
+        Cost is per CONDITION, not per head: ``5 + len(random_seeds)``
+        evaluations total.
+
+        Returns a flat dict: n_heads, baseline, low_utility, random,
+        high_utility, causal_effect, and (when ``freq_order`` is given) low_freq,
+        high_freq, frequency_effect — each a single population accuracy.
+        """
+        k = k_dims or self.k_dims
+        seeds = random_seeds or list(range(5))
+        eval_samples = samples[:n_samples]
+        norms_matrix: np.ndarray | None = utility_scores.get("_norms")
+        head_dim = self._get_head_dim()
+
+        low_map: dict = {}
+        high_map: dict = {}
+        for (layer_idx, head_idx) in retrieval_heads:
+            if norms_matrix is not None:
+                head_norms = norms_matrix[layer_idx, head_idx]
+            else:
+                scalar_grid = np.array(utility_scores["per_head_scalar"])
+                head_norms = np.full(
+                    head_dim, scalar_grid[layer_idx, head_idx], dtype=np.float32
+                )
+            order = np.argsort(head_norms)
+            low_map[(layer_idx, head_idx)] = order[:k].tolist()
+            high_map[(layer_idx, head_idx)] = order[-k:].tolist()
+
+        out: dict = {
+            "n_heads": len(retrieval_heads),
+            "k_dims": k,
+            "baseline": self._evaluate_population(eval_samples, None),
+            "low_utility": self._evaluate_population(eval_samples, low_map),
+            "high_utility": self._evaluate_population(eval_samples, high_map),
+        }
+        rand_accs = []
+        for seed in seeds:
+            rng = np.random.RandomState(seed)
+            rmap = {
+                lh: rng.choice(head_dim, size=k, replace=False).tolist()
+                for lh in retrieval_heads
+            }
+            rand_accs.append(self._evaluate_population(eval_samples, rmap))
+        out["random"] = float(np.mean(rand_accs))
+        out["causal_effect"] = out["random"] - out["low_utility"]
+        logger.info(
+            "Population (%d heads): baseline=%.3f low=%.3f rand=%.3f high=%.3f",
+            out["n_heads"], out["baseline"], out["low_utility"],
+            out["random"], out["high_utility"],
+        )
+
+        if freq_order is not None:
+            fo = np.asarray(freq_order).astype(int)
+            low_freq = fo[:k].tolist()
+            high_freq = fo[-k:].tolist()
+            out["low_freq"] = self._evaluate_population(
+                eval_samples, {lh: low_freq for lh in retrieval_heads}
+            )
+            out["high_freq"] = self._evaluate_population(
+                eval_samples, {lh: high_freq for lh in retrieval_heads}
+            )
+            out["frequency_effect"] = out["low_freq"] - out["high_freq"]
+            logger.info(
+                "Population freq: low_freq=%.3f high_freq=%.3f freq_effect=%.4f",
+                out["low_freq"], out["high_freq"], out["frequency_effect"],
+            )
+        return out
 
     # ------------------------------------------------------------------
     # Causal effect

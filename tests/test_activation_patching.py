@@ -122,3 +122,87 @@ def test_checkpoint_resume_skips_done_heads(tmp_path, monkeypatch):
     r3 = p3.run_patching_experiment(heads, us, samples, **kwargs)
     assert set(r3.keys()) == set(heads)
     assert counter["n"] == per_head                    # only the missing head
+
+
+# ---- population-level patching (ceiling-breaking) --------------------------
+
+import types  # noqa: E402
+
+
+def _fake_model_for_hooks(n_layers=2, n_heads=4, n_kv=2, head_dim=4):
+    """Fake HF-like model that records the forward hook registered on each
+    q_proj / k_proj so the hook function can be invoked directly in a test."""
+    torch = pytest.importorskip("torch")
+
+    class _Rec:
+        def __init__(self):
+            self.hook = None
+
+        def register_forward_hook(self, fn):
+            self.hook = fn
+            return types.SimpleNamespace(remove=lambda: None)
+
+    class _Layer:
+        def __init__(self):
+            self.self_attn = types.SimpleNamespace(q_proj=_Rec(), k_proj=_Rec())
+
+    class _Model:
+        def __init__(self):
+            self.model = types.SimpleNamespace(layers=[_Layer() for _ in range(n_layers)])
+            self.config = types.SimpleNamespace(
+                num_attention_heads=n_heads, num_key_value_heads=n_kv,
+                head_dim=head_dim, hidden_size=n_heads * head_dim)
+
+        def eval(self):
+            return self
+
+    return _Model()
+
+
+def test_patch_heads_zeroes_correct_gqa_columns():
+    torch = pytest.importorskip("torch")
+    head_dim, n_heads, n_kv = 4, 4, 2          # GQA group_size = 2
+    model = _fake_model_for_hooks(2, n_heads, n_kv, head_dim)
+    patcher = ActivationPatcher(model, tokenizer=None, config={})
+
+    # layer 0: head 0 zero dim 1; head 3 zero dim 2
+    head_dims = {(0, 0): [1], (0, 3): [2]}
+    with patcher.patch_heads(head_dims, mode="qk"):
+        qhook = model.model.layers[0].self_attn.q_proj.hook
+        khook = model.model.layers[0].self_attn.k_proj.hook
+        # q_proj width = n_heads*head_dim = 16; cols: head0 dim1 -> 1, head3 dim2 -> 14
+        q_out = qhook(None, None, torch.ones(1, 2, n_heads * head_dim))
+        # k_proj width = n_kv*head_dim = 8; head0 -> kv0 col 1; head3 -> kv1 col 4+2=6
+        k_out = khook(None, None, torch.ones(1, 2, n_kv * head_dim))
+
+    assert q_out[0, 0, 1] == 0 and q_out[0, 0, 14] == 0
+    assert q_out[0, 0, 0] == 1 and q_out[0, 0, 2] == 1     # untouched
+    assert k_out[0, 0, 1] == 0 and k_out[0, 0, 6] == 0
+    assert k_out[0, 0, 0] == 1 and k_out[0, 0, 7] == 1     # untouched
+
+
+def test_run_population_patching_is_per_condition_not_per_head():
+    import numpy as np
+    patcher = _make_patcher()
+    heads = [(0, 0), (0, 1), (1, 2)]
+    norms = np.random.RandomState(0).rand(2, 3, 8)
+    us = {"_norms": norms}
+    samples = [{"prompt_ids": [1, 2, 3], "code": "x"}] * 4
+
+    calls = {"n": 0}
+
+    def fake_pop(samples, head_dims=None, mode="qk"):
+        calls["n"] += 1
+        return 1.0 if head_dims is None else 0.7
+
+    # monkeypatch via setattr (no pytest fixture needed here)
+    patcher._evaluate_population = fake_pop
+    out = patcher.run_population_patching(
+        heads, us, samples, k_dims=2, n_samples=4,
+        random_seeds=[0, 1, 2], freq_order=np.arange(8))
+
+    # evals = baseline + low + high + 3 random + low_freq + high_freq = 8 (NOT x heads)
+    assert calls["n"] == 5 + 3
+    assert out["n_heads"] == 3
+    assert out["baseline"] == 1.0
+    assert "frequency_effect" in out and "causal_effect" in out
