@@ -24,6 +24,12 @@ import pandas as pd
 import torch
 from torch import Tensor
 
+try:  # progress bar is optional; degrade to a no-op if tqdm is unavailable
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover
+    def tqdm(iterable=None, **_kwargs):
+        return iterable
+
 logger = logging.getLogger(__name__)
 
 
@@ -327,9 +333,13 @@ class ActivationPatcher:
             if checkpoint_path is not None:
                 _save_checkpoint(checkpoint_path, baseline_acc, results)
 
-        for (layer_idx, head_idx) in retrieval_heads:
-            if (layer_idx, head_idx) in results:
-                continue  # already computed in a previous session (resume)
+        # Only patch heads not already restored from a checkpoint, so the
+        # progress bar reflects true remaining work on resume.
+        todo = [h for h in retrieval_heads if h not in results]
+        done = len(retrieval_heads) - len(todo)
+        for (layer_idx, head_idx) in tqdm(
+            todo, desc=f"Patching heads ({done} done)", unit="head"
+        ):
             logger.info("Patching experiment: layer=%d head=%d", layer_idx, head_idx)
 
             if norms_matrix is not None:
