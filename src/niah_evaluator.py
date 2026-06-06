@@ -181,11 +181,15 @@ class NIAHEvaluator:
                             max_length=ctx_len + 512,
                         )
                         input_ids = encoding["input_ids"].to(device)
+                        attention_mask = encoding["attention_mask"].to(device)
 
                         out = self.model.generate(
                             input_ids,
+                            attention_mask=attention_mask,
                             max_new_tokens=20,
                             do_sample=False,
+                            pad_token_id=self.tokenizer.pad_token_id
+                            or self.tokenizer.eos_token_id,
                         )
                         generated_ids = out[0, input_ids.shape[1]:]
                         generated_text = self.tokenizer.decode(

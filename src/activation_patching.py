@@ -262,8 +262,11 @@ class ActivationPatcher:
                 with ctx:
                     out = self.model.generate(
                         input_ids,
+                        attention_mask=torch.ones_like(input_ids),
                         max_new_tokens=20,
                         do_sample=False,
+                        pad_token_id=self.tokenizer.pad_token_id
+                        or self.tokenizer.eos_token_id,
                     )
 
                 generated_ids = out[0, input_ids.shape[1]:]
@@ -318,7 +321,12 @@ class ActivationPatcher:
                 ctx = self.patch_heads(head_dims, mode) if head_dims else _null_context()
                 with ctx:
                     out = self.model.generate(
-                        input_ids, max_new_tokens=20, do_sample=False
+                        input_ids,
+                        attention_mask=torch.ones_like(input_ids),
+                        max_new_tokens=20,
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.pad_token_id
+                        or self.tokenizer.eos_token_id,
                     )
                 gen = self.tokenizer.decode(
                     out[0, input_ids.shape[1]:], skip_special_tokens=True
