@@ -12,13 +12,17 @@ BOTH the argmax score and the quantization-robust mass score:
      same sign and significance (clustered permutation) in both modes?
 
 The claim defended is the stability of the *finding*, not byte-identical head
-sets. Run on ONE representative model at seq=4096 (enough to see the effect
-without straining fp16 VRAM). One model suffices: the effect is a numerical
-artifact of quantization, architecture-independent.
+sets. Run on ONE model that PRODUCED a significant finding (so the test is
+informative -- a null model like LLaMA-3.1, d~0/p~1, would stay null trivially
+and tell us nothing). We default to OLMo-2: it has a significant utility effect
+(d=+0.50) and is also the Layer-D model, so robustness there matters most.
+Quantization perturbs the discrete argmax near the detection threshold, which
+does NOT require long context; we use seq=2048 so fp16 (eager attention) stays
+within a 24 GB budget.
 
 Usage:
-    python scripts/run_quant_ablation.py --model llama3
-    python scripts/run_quant_ablation.py --model llama3 --seq 4096 --n_samples 50
+    python scripts/run_quant_ablation.py                      # olmo, seq=2048
+    python scripts/run_quant_ablation.py --model qwen --seq 2048
 """
 
 from __future__ import annotations
@@ -105,9 +109,13 @@ def _finding(util: dict) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="A2 quantization ablation (8-bit vs fp16)")
-    parser.add_argument("--model", default="llama3", help="Model key (one representative model).")
+    parser.add_argument("--model", default="olmo",
+                        help="Model key. Default olmo: a SIGNIFICANT-finding model (d=+0.50) "
+                             "+ the Layer-D model. A null model (llama3) would be uninformative.")
     parser.add_argument("--config", default="configs/config.yaml")
-    parser.add_argument("--seq", type=int, default=4096, help="Single context length (fp16-friendly).")
+    parser.add_argument("--seq", type=int, default=2048,
+                        help="Single context length. 2048 keeps fp16 within 24 GB; "
+                             "quantization's argmax shift does not need long context.")
     parser.add_argument("--n_samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -126,6 +134,14 @@ def main() -> None:
 
     logger.info("=== Mode 1/2: 8-bit ===")
     r8 = _score_one_mode(args.model, model_cfg, config, specs, args.seed, load_in_8bit=True)
+    # Free the 8-bit model fully before loading fp16 (the per-mode finally del's
+    # the model, but detector/analyzer refs only die here, on frame exit).
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
     logger.info("=== Mode 2/2: fp16 ===")
     r16 = _score_one_mode(args.model, model_cfg, config, specs, args.seed, load_in_8bit=False)
 
