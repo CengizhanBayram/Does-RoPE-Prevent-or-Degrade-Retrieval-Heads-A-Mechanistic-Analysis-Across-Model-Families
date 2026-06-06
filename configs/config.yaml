@@ -1,11 +1,9 @@
 # ---------------------------------------------------------------------------
 # Experiment configuration.
 #
-# Reproducibility (item C1): each model has a `revision` field. HuggingFace
-# weights can be updated in place, so for the reportable run REPLACE "main"
-# with the exact commit SHA from the model's "Files and versions" page
-# (e.g. revision: "0e9e39f249a16976918f6564b8830bc894c89659"). The loader
-# logs a warning whenever revision is "main"/null.
+# Reproducibility (item C1): each model's `revision` is pinned to an exact
+# commit SHA (fetched from the model's HuggingFace main branch, 2026-06) so the
+# weights cannot change under us. The loader warns if a revision is "main"/null.
 #
 # Quantization (item A2): `load_in_8bit` affects attention distributions and
 # therefore retrieval-head detection. Run at least one model with
@@ -14,7 +12,7 @@
 models:
   llama3:
     hf_id: "meta-llama/Meta-Llama-3.1-8B"
-    revision: "main"        # TODO(C1): pin to a commit SHA before the final run
+    revision: "d04e592bb4f6aa9cfee91e2e20afa771667e1d4b"   # pinned (main @ 2026-06)
     theta: 500000
     n_layers: 32
     n_heads: 32
@@ -23,7 +21,7 @@ models:
     license: "llama3.1"     # gated; usage terms must be cited (item G2)
   llama2:
     hf_id: "meta-llama/Llama-2-7b-hf"
-    revision: "main"        # TODO(C1): pin to a commit SHA before the final run
+    revision: "01c7f73d771dfac7d292323805ebc428287df4f9"   # pinned (main @ 2026-06)
     theta: 10000
     n_layers: 32
     n_heads: 32
@@ -32,7 +30,7 @@ models:
     license: "llama2"       # gated; usage terms must be cited (item G2)
   qwen:
     hf_id: "Qwen/Qwen2.5-7B"
-    revision: "main"        # TODO(C1): pin to a commit SHA before the final run
+    revision: "d149729398750b98c0af14eb82c78cfe92750796"   # pinned (main @ 2026-06)
     theta: 1000000
     n_layers: 28
     n_heads: 28
@@ -41,7 +39,7 @@ models:
     license: "apache-2.0"
   olmo:
     hf_id: "allenai/OLMo-2-1124-7B"
-    revision: "main"        # TODO(C1): pin to a commit SHA before the final run
+    revision: "7df9a82518afdecae4e8c026b27adccc8c1f0032"   # pinned (main @ 2026-06)
     theta: 500000
     n_layers: 32
     n_heads: 32
