@@ -1,0 +1,40 @@
+{
+  "model": "olmo",
+  "seed": 42,
+  "baseline": 1.0,
+  "n_samples": 200,
+  "top_k_heads": 30,
+  "sweep": [
+    {
+      "k": 8,
+      "low_freq_acc": 0.985,
+      "random_acc": 1.0,
+      "drop": 0.015000000000000013
+    },
+    {
+      "k": 16,
+      "low_freq_acc": 0.885,
+      "random_acc": 1.0,
+      "drop": 0.11499999999999999
+    },
+    {
+      "k": 32,
+      "low_freq_acc": 0.175,
+      "random_acc": 0.98,
+      "drop": 0.825
+    },
+    {
+      "k": 48,
+      "low_freq_acc": 0.115,
+      "random_acc": 0.87,
+      "drop": 0.885
+    },
+    {
+      "k": 64,
+      "low_freq_acc": 0.07,
+      "random_acc": 0.375,
+      "drop": 0.9299999999999999
+    }
+  ],
+  "monotone_increasing": true
+}

@@ -1,0 +1,50 @@
+{
+  "llama3": {
+    "hf_id": "meta-llama/Meta-Llama-3.1-8B",
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "attention_type": "GQA (group_size=4)",
+    "head_dim": 128,
+    "rope_theta": 500000.0,
+    "q_proj_out_expected": 4096,
+    "kv_proj_out_expected": 1024,
+    "rope_pairing_rotate_half": true,
+    "rope_pairing_interleaved": false
+  },
+  "llama2": {
+    "hf_id": "meta-llama/Llama-2-7b-hf",
+    "num_attention_heads": 32,
+    "num_key_value_heads": 32,
+    "attention_type": "MHA",
+    "head_dim": 128,
+    "rope_theta": 10000.0,
+    "q_proj_out_expected": 4096,
+    "kv_proj_out_expected": 4096,
+    "rope_pairing_rotate_half": true,
+    "rope_pairing_interleaved": false
+  },
+  "qwen": {
+    "hf_id": "Qwen/Qwen2.5-7B",
+    "num_attention_heads": 28,
+    "num_key_value_heads": 4,
+    "attention_type": "GQA (group_size=7)",
+    "head_dim": 128,
+    "rope_theta": 1000000.0,
+    "q_proj_out_expected": 3584,
+    "kv_proj_out_expected": 512,
+    "rope_pairing_rotate_half": true,
+    "rope_pairing_interleaved": false
+  },
+  "olmo": {
+    "hf_id": "allenai/OLMo-2-1124-7B",
+    "num_attention_heads": 32,
+    "num_key_value_heads": 32,
+    "attention_type": "MHA",
+    "head_dim": 128,
+    "rope_theta": 500000.0,
+    "q_proj_out_expected": 4096,
+    "kv_proj_out_expected": 4096,
+    "rope_pairing_rotate_half": true,
+    "rope_pairing_interleaved": false
+  }
+}

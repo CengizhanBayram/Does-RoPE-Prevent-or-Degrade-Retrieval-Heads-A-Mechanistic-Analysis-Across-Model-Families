@@ -1,0 +1,22 @@
+{
+  "qwen": {
+    "n_q_heads": 28,
+    "n_kv_heads": 4,
+    "group_size": 7,
+    "n_retrieval_heads": 58,
+    "kv_groups_with_retrieval": 27,
+    "mean_retrieval_per_active_group": 2.1481481481481484,
+    "max_retrieval_in_a_group": 7,
+    "frac_groups_fully_retrieval": 0.037037037037037035
+  },
+  "llama3": {
+    "n_q_heads": 32,
+    "n_kv_heads": 8,
+    "group_size": 4,
+    "n_retrieval_heads": 51,
+    "kv_groups_with_retrieval": 35,
+    "mean_retrieval_per_active_group": 1.457142857142857,
+    "max_retrieval_in_a_group": 4,
+    "frac_groups_fully_retrieval": 0.02857142857142857
+  }
+}

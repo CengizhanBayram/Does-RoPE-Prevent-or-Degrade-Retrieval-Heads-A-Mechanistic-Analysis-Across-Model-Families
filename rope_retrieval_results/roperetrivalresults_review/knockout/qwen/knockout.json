@@ -1,0 +1,10 @@
+{
+  "model": "qwen",
+  "baseline": 1.0,
+  "n_retrieval_heads": 58,
+  "retrieval_drop": 0.42222219705581665,
+  "random_drop": 0.0,
+  "masked_retrieval": 0.5777778029441833,
+  "masked_random": 1.0,
+  "interpretable": true
+}

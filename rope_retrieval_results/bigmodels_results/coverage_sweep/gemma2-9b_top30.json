@@ -1,0 +1,31 @@
+{
+  "n_heads": 30,
+  "k_dims": 32,
+  "n_samples": 200,
+  "baseline": 1.0,
+  "low_utility": 0.96,
+  "high_utility": 1.0,
+  "random": 1.0,
+  "causal_effect": 0.040000000000000036,
+  "low_freq": 0.425,
+  "high_freq": 1.0,
+  "frequency_effect": -0.575,
+  "frequency_mcnemar": {
+    "b_lowfreq_worse": 115,
+    "c_lowfreq_better": 0,
+    "n_discordant": 115,
+    "p_value": 4.81482486096809e-35
+  },
+  "frequency_effect_ci95": [
+    -0.64,
+    -0.505
+  ],
+  "low_freq_control_heads": 1.0,
+  "retrieval_head_specificity": 0.575,
+  "baseline_gate": 1.0,
+  "model": "gemma2-9b",
+  "hf_id": "google/gemma-2-9b",
+  "top_k": 30,
+  "n_detected": 45,
+  "coverage": 0.6666666666666666
+}

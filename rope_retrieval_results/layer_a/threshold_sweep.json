@@ -1,0 +1,98 @@
+{
+  "llama3": [
+    {
+      "threshold": 0.05,
+      "n_retrieval_heads": 62,
+      "cohens_d": -0.02682916003235452,
+      "perm_p": 1.0
+    },
+    {
+      "threshold": 0.1,
+      "n_retrieval_heads": 47,
+      "cohens_d": 0.0668887677401104,
+      "perm_p": 1.0
+    },
+    {
+      "threshold": 0.15,
+      "n_retrieval_heads": 43,
+      "cohens_d": 0.12867373052456552,
+      "perm_p": 0.999000499750125
+    },
+    {
+      "threshold": 0.2,
+      "n_retrieval_heads": 40,
+      "cohens_d": 0.1869300892627482,
+      "perm_p": 0.9975012493753124
+    },
+    {
+      "threshold": 0.3,
+      "n_retrieval_heads": 29,
+      "cohens_d": 0.22807506851471476,
+      "perm_p": 0.9890054972513743
+    }
+  ],
+  "qwen": [
+    {
+      "threshold": 0.05,
+      "n_retrieval_heads": 74,
+      "cohens_d": -0.5412253918504142,
+      "perm_p": 0.0004997501249375312
+    },
+    {
+      "threshold": 0.1,
+      "n_retrieval_heads": 59,
+      "cohens_d": -0.47141708483529654,
+      "perm_p": 0.0009995002498750624
+    },
+    {
+      "threshold": 0.15,
+      "n_retrieval_heads": 52,
+      "cohens_d": -0.545798634268505,
+      "perm_p": 0.0009995002498750624
+    },
+    {
+      "threshold": 0.2,
+      "n_retrieval_heads": 45,
+      "cohens_d": -0.5505897314799407,
+      "perm_p": 0.0014992503748125937
+    },
+    {
+      "threshold": 0.3,
+      "n_retrieval_heads": 38,
+      "cohens_d": -0.5585386771192917,
+      "perm_p": 0.0004997501249375312
+    }
+  ],
+  "olmo": [
+    {
+      "threshold": 0.05,
+      "n_retrieval_heads": 269,
+      "cohens_d": 0.2160914392190016,
+      "perm_p": 0.013493253373313344
+    },
+    {
+      "threshold": 0.1,
+      "n_retrieval_heads": 87,
+      "cohens_d": 0.5034529038813352,
+      "perm_p": 0.0004997501249375312
+    },
+    {
+      "threshold": 0.15,
+      "n_retrieval_heads": 73,
+      "cohens_d": 0.5473402839104551,
+      "perm_p": 0.0004997501249375312
+    },
+    {
+      "threshold": 0.2,
+      "n_retrieval_heads": 62,
+      "cohens_d": 0.5414079132723725,
+      "perm_p": 0.0004997501249375312
+    },
+    {
+      "threshold": 0.3,
+      "n_retrieval_heads": 49,
+      "cohens_d": 0.5331364189459225,
+      "perm_p": 0.0004997501249375312
+    }
+  ]
+}

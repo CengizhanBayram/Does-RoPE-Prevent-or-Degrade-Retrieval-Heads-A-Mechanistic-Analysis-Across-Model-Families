@@ -1,0 +1,22 @@
+{
+  "olmo": {
+    "spearman_rho": 0.5439568033279438,
+    "n_argmax_heads": 430,
+    "jaccard_topN": 0.46757679180887374,
+    "intersection": 274,
+    "union": 586,
+    "cohens_d_argmax": 0.2810099167042646,
+    "cohens_d_copy": 0.45274784708975474,
+    "sign_agrees": true
+  },
+  "qwen": {
+    "spearman_rho": NaN,
+    "n_argmax_heads": 64,
+    "jaccard_topN": 0.21904761904761905,
+    "intersection": 23,
+    "union": 105,
+    "cohens_d_argmax": -0.5756678892073018,
+    "cohens_d_copy": -0.6156798518875211,
+    "sign_agrees": true
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "model": "olmo",
+  "n_samples_used": 30,
+  "pearson_r": 0.5671039284356354,
+  "spearman_rho": 0.5439568033279438
+}

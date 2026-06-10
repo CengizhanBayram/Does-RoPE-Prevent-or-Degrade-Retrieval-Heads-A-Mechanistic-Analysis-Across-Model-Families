@@ -1,0 +1,34 @@
+{
+  "n_heads": 30,
+  "k_dims": 16,
+  "n_samples": 200,
+  "baseline": 1.0,
+  "low_utility": 0.93,
+  "high_utility": 1.0,
+  "random": 0.9866666666666667,
+  "causal_effect": 0.05666666666666664,
+  "low_freq": 0.34,
+  "high_freq": 0.995,
+  "frequency_effect": -0.655,
+  "frequency_mcnemar": {
+    "b_lowfreq_worse": 131,
+    "c_lowfreq_better": 0,
+    "n_discordant": 131,
+    "p_value": 7.346839692639297e-40
+  },
+  "frequency_effect_ci95": [
+    -0.72,
+    -0.59
+  ],
+  "low_freq_control_heads": 0.985,
+  "retrieval_head_specificity": 0.645,
+  "perplexity_baseline": 2.108887819790144,
+  "perplexity_lowfreq": 2.2779203946825097,
+  "perplexity_ratio": 1.0801524734061891,
+  "niah_rel_drop": 0.6599999999999999,
+  "perplexity_rel_increase": 0.08015247340618918,
+  "specificity_ratio": 0.12144314152452908,
+  "specificity_verdict": "retrieval-specific",
+  "seed": 123,
+  "model": "qwen"
+}

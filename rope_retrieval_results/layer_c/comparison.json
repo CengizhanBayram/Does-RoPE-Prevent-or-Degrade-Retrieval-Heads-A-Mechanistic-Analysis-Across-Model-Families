@@ -1,0 +1,21 @@
+{
+  "h1_assessment": "H1 NOT supported: higher \u03b8 (500000) has MORE retrieval heads (47) than \u03b8=10000 (42)",
+  "confound_note": "\u03b8 differs alongside data, token count, tokenizer, and MHA(llama2) vs GQA(llama3); not a clean \u03b8 manipulation (see docs/LIMITATIONS.md P10).",
+  "paired_specs": true,
+  "llama2": {
+    "theta": 10000,
+    "n_retrieval_heads": 42,
+    "retrieval_fraction": 0.041015625,
+    "cohens_d": 0.429364852521899,
+    "clustered_permutation_p": 0.6475352464753524,
+    "partial_spearman_r": 0.06316806974879959
+  },
+  "llama3": {
+    "theta": 500000,
+    "n_retrieval_heads": 47,
+    "retrieval_fraction": 0.0458984375,
+    "cohens_d": 0.0668887677401104,
+    "clustered_permutation_p": 0.9998000199980002,
+    "partial_spearman_r": -0.15347407725062265
+  }
+}

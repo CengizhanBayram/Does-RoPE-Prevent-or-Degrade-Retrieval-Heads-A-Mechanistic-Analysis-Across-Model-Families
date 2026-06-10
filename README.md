@@ -278,10 +278,10 @@ Apache-2.0; PG-19 per its dataset card. Cite each in any publication (item G2).
 ## Citation
 
 ```bibtex
-@article{bayram2025rope_retrieval,
+@article{anonymous2025,
   title   = {Does {RoPE} Prevent or Degrade Retrieval Heads?
              A Mechanistic Analysis Across Model Families},
-  author  = {Bayram, Cengizhan},
+  author  = {Anonymous Authors},
   year    = {2025}
 }
 ```

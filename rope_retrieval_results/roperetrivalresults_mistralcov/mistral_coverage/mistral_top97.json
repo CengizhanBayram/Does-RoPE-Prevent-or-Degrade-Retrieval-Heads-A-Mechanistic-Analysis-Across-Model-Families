@@ -1,0 +1,30 @@
+{
+  "n_heads": 97,
+  "k_dims": 16,
+  "n_samples": 200,
+  "baseline": 1.0,
+  "low_utility": 0.935,
+  "high_utility": 1.0,
+  "random": 0.9983333333333334,
+  "causal_effect": 0.06333333333333335,
+  "low_freq": 0.31,
+  "high_freq": 1.0,
+  "frequency_effect": -0.69,
+  "frequency_mcnemar": {
+    "b_lowfreq_worse": 138,
+    "c_lowfreq_better": 0,
+    "n_discordant": 138,
+    "p_value": 5.739718509874451e-42
+  },
+  "frequency_effect_ci95": [
+    -0.755,
+    -0.625
+  ],
+  "low_freq_control_heads": 0.0,
+  "retrieval_head_specificity": -0.31,
+  "baseline_gate": 1.0,
+  "model": "mistral7b",
+  "top_k": 97,
+  "n_detected": 97,
+  "coverage": 1.0
+}

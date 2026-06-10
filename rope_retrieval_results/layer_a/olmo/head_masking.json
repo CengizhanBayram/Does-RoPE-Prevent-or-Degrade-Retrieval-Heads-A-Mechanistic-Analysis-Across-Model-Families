@@ -1,0 +1,15 @@
+{
+  "model": "olmo",
+  "context_lengths": [
+    1024,
+    2048,
+    4096
+  ],
+  "n_retrieval_heads_masked": 87,
+  "n_random_heads_masked": 87,
+  "mean_normal": 1.0,
+  "mean_masked_retrieval": 0.0,
+  "mean_masked_random": 1.0,
+  "retrieval_drop": 1.0,
+  "random_drop": 0.0
+}
