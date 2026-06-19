@@ -39,6 +39,7 @@ cache/
 # --- Manuscript: NOT part of the anonymous code+data release ---
 paper/
 paper_1/
+paper_3/
 # --- OS ---
 .DS_Store
 Thumbs.db
