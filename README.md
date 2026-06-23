@@ -5,7 +5,7 @@ Code, data, and a reproducibility harness for the paper:
 
 > **Does RoPE Prevent or Degrade Retrieval Heads? A Mechanistic Analysis Across Model Families**
 > Cengizhan Bayram (Independent Researcher).
-> arXiv preprint, 2026. *(arXiv ID added on announcement.)*
+> arXiv:2606.21249, 2026. DOI: [10.48550/arXiv.2606.21249](https://doi.org/10.48550/arXiv.2606.21249)
 
 This repository is **self-contained and auditable**: every number in the paper traces to a
 raw JSON under [`rope_retrieval_results/`](rope_retrieval_results/) (see that folder's
@@ -50,17 +50,19 @@ significance.
 | Core panel | LLaMA-3.1-8B | GQA | 500,000 | Llama-3.1 |
 | Core panel | Qwen2.5-7B | GQA | 1,000,000 | Apache-2.0 |
 | Core panel | OLMo-2-7B | MHA | 500,000 | Apache-2.0 |
-| Causal test (extra) | Qwen2.5-14B, Gemma-2-9B, Mistral-7B | GQA | — | (resp.) |
+| Causal test (extra) | Qwen2.5-14B, Gemma-2-9B, Mistral-7B | GQA | — | Apache-2.0 / Gemma / Apache-2.0 |
 
-Exact HuggingFace commit hashes are pinned in [`configs/config.yaml`](configs/config.yaml)
-(and listed in the paper's appendix).
+The four core models' HuggingFace commit hashes are pinned in [`configs/config.yaml`](configs/config.yaml)
+(and listed in the paper's appendix, Table C.3); the three extra causal-test models are loaded
+from their public HuggingFace checkpoints.
 
 ---
 
 ## Pipeline
 
-The study has three analyses, labelled by pipeline stage (there is **no separate Layer C** —
-an early position-conditioned analysis was folded into A/B):
+The study is organised by three pipeline stages — A, B, and D. **Layer C** (a within-family
+$\theta$ comparison, LLaMA-2 vs LLaMA-3.1) is reported *within* Layer A (the H1 test in
+Section 4) rather than as a separate stage, so the table below lists A, B, and D:
 
 | Stage | What | Models | Approx. runtime |
 |-------|------|--------|-----------------|
@@ -91,9 +93,9 @@ export HF_TOKEN=hf_xxx          # env var (also read from a .env file)
 `src/auth_utils.py` resolves the token from argument → env var → `.env`.
 **Never commit tokens** — `.env`, `*.token`, `hf_token*` are git-ignored.
 
-**Pin revisions before a reportable run.** `configs/config.yaml` ships `revision: "main"`
-per model; replace each with the exact commit SHA for reproducibility (the loader warns while
-a revision is unpinned). See [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md).
+**Pinned revisions.** `configs/config.yaml` ships exact commit SHAs for the four core models,
+so reportable runs are reproducible out of the box (the loader warns if a revision is ever left
+as `main`/null). See [docs/REPRODUCIBILITY.md](docs/REPRODUCIBILITY.md).
 
 ---
 
@@ -235,11 +237,10 @@ Contributions and independent replications are welcome — open an issue or PR.
       eprint={2606.21249},
       archivePrefix={arXiv},
       primaryClass={cs.LG},
+      doi={10.48550/arXiv.2606.21249},
       url={https://arxiv.org/abs/2606.21249}, 
 }
 ```
-
-*(Replace `arXiv:XXXX.XXXXX` with the assigned identifier once the preprint is announced.)*
 
 ## Acknowledgements
 

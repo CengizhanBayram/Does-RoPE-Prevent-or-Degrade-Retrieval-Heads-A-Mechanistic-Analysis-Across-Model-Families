@@ -40,6 +40,16 @@ cache/
 paper/
 paper_1/
 paper_3/
+paper_4/
+# --- v2 / extended-version experiments: kept PRIVATE until ready to publish ---
+# (un-ignore these when the extended version is ready to go public)
+notebooks_dev/
+scripts/run_theta_sweep.py
+scripts/run_seed_replication.py
+scripts/run_distance_sweep.py
+scripts/run_freqband_sweep.py
+scripts/run_model_panel.py
+configs/config_v2.yaml
 # --- OS ---
 .DS_Store
 Thumbs.db
