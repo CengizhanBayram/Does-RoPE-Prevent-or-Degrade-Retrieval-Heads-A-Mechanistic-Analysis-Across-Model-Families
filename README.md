@@ -228,12 +228,14 @@ Contributions and independent replications are welcome — open an issue or PR.
 ## Citation
 
 ```bibtex
-@article{bayram2026rope,
-  title   = {Does {RoPE} Prevent or Degrade Retrieval Heads?
-             A Mechanistic Analysis Across Model Families},
-  author  = {Bayram, Cengizhan},
-  journal = {arXiv preprint arXiv:XXXX.XXXXX},
-  year    = {2026}
+@misc{bayram2026doesropepreventdegrade,
+      title={Does RoPE Prevent or Degrade Retrieval Heads? A Mechanistic Analysis Across Model Families}, 
+      author={Cengizhan Bayram},
+      year={2026},
+      eprint={2606.21249},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2606.21249}, 
 }
 ```
 
