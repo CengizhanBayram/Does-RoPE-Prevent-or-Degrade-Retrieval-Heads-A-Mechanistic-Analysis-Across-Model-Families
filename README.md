@@ -194,7 +194,7 @@ This single repository tracks every version of the project:
 
 - **`arxiv-v1`** (git tag + GitHub Release) — the exact code and data matching the arXiv v1
   preprint. Check this out to reproduce the paper as published.
-- **`main`** — ongoing work toward the extended (journal) version; see the Roadmap below.
+- **`main`** — ongoing work toward the extended (journal) version; see Future work below.
 
 ```bash
 git checkout arxiv-v1     # reproduce the preprint exactly
@@ -203,9 +203,9 @@ git checkout main         # latest, including new experiments
 
 Each subsequent paper version gets its own tag (`v2`, …); the arXiv link does not change.
 
-## Roadmap (extended version)
+## Future work
 
-Planned additions that strengthen the work toward a peer-reviewed venue:
+Natural extensions of this study (see also the Limitations section of the paper):
 
 - **Real long-context benchmarks** (RULER / LongBench): test whether the same heads and the
   frequency dependence transfer beyond synthetic NIAH.
